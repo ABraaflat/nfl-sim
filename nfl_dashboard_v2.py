@@ -613,7 +613,14 @@ def skill_rows(chosen):
 # =====================================================================
 # PLAYER STAT SIM
 # =====================================================================
+PASS_ENV = {"passing_yards", "passing_tds", "receptions", "receiving_yards", "receiving_tds"}
+PASS_RHO = 0.10
+
+
 def sim_players(R, profiles, home, away, game):
+    """Simulates each player's stats game by game. A shared 'passing game' factor per team makes a QB and his receivers rise and fall together,
+    and the Anytime TD draw is built from the same rushing and receiving TD draws as the TD props, so same-game parlays stay consistent."""
+    from scipy.stats import norm, poisson
     cols = ["Player", "Pos"] + [NICE[s] for s in STATS]
     tables, avg_pts, draws = {}, {}, {}
     for team, arr in ((home, game["hs"]), (away, game["as"])):
@@ -621,21 +628,37 @@ def sim_players(R, profiles, home, away, game):
         sims = len(pts)
         avg_pts[team] = float(pts.mean())
         f = np.clip(pts / (R["league_avg"] + R["off"][team]), 0.3, 2.0)
+        zt = rng.standard_normal(sims)
         rows = []
+
+        def gen(stat, m, s):
+            mean = m[stat] * f
+            if stat in PASS_ENV:
+                z = np.sqrt(PASS_RHO) * zt + np.sqrt(1.0 - PASS_RHO) * rng.standard_normal(sims)
+            else:
+                z = rng.standard_normal(sims)
+            if stat in DISCRETE:
+                return poisson.ppf(np.clip(norm.cdf(z), 1e-9, 1 - 1e-9), np.clip(mean, 1e-9, None))
+            return np.clip(np.round(mean + s[stat] * z), 0, None)
+
         for name, pos, m, s in profiles.get(team, []):
             row = {"Player": name, "Pos": pos}
+            made = {}
             for stat in SHOW.get(pos, STATS):
-                mean = m[stat] * f
-                if stat in DISCRETE:
-                    draw = rng.poisson(np.clip(mean, 0, None))
-                else:
-                    draw = np.clip(np.round(rng.normal(mean, s[stat])), 0, None)
+                draw = gen(stat, m, s)
+                made[stat] = draw
                 lo, hi = np.percentile(draw, [10, 90])
                 draws[(team, name, NICE[stat])] = np.asarray(draw).astype(np.int16)
                 row[NICE[stat]] = f"{draw.mean():.1f} ({lo:.0f}-{hi:.0f})"
             tdm = float(m["rushing_tds"]) + float(m["receiving_tds"])
             if tdm > 0.02:
-                draws[(team, name, "Anytime TD")] = (rng.poisson(np.clip(f * float(m["rushing_tds"]), 0, None)) + rng.poisson(np.clip(f * float(m["receiving_tds"]), 0, None))).astype(np.int16)
+                rt = made.get("rushing_tds")
+                if rt is None:
+                    rt = gen("rushing_tds", m, s)
+                ct = made.get("receiving_tds")
+                if ct is None:
+                    ct = gen("receiving_tds", m, s)
+                draws[(team, name, "Anytime TD")] = (np.asarray(rt) + np.asarray(ct)).astype(np.int16)
             rows.append(row)
         tables[team] = pd.DataFrame(rows).reindex(columns=cols).fillna("")
     return {"tables": tables, "avg_pts": avg_pts, "draws": draws}
@@ -2909,7 +2932,14 @@ def save_preds(df):
 
 
 def add_preds(new):
-    allp = pd.concat([load_preds(), _clean_preds(new)], ignore_index=True)
+    old = load_preds()
+    new = _clean_preds(new)
+    if len(old) and len(new):
+        # a pick saved before the game must not be overwritten by one saved after it started
+        k = lambda d: d["season"].astype(int).astype(str) + "|" + d["week"].astype(int).astype(str) + "|" + d["home"] + "|" + d["away"]
+        keep_old = set(k(old[~old["late"].astype(bool)]))
+        new = new[~(new["late"].astype(bool) & k(new).isin(keep_old))]
+    allp = pd.concat([old, new], ignore_index=True)
     allp = allp.drop_duplicates(["season", "week", "home", "away"], keep="last")
     return allp, save_preds(allp)
 
@@ -2972,7 +3002,7 @@ def units_110(rec):
 
 def compute_slate(week, sims):
     S_sl = S_all if (use_style and S_all) else None
-    sl = {"week": week, "sims": sims, "df": run_slate(R, S_sl, sched, latest, week, sims, qbs, qbs0, bool(use_ros and not ros_df.empty), inj_df, use_inj, set(weeks)), "ros": bool(use_ros and not ros_df.empty), "ov": len(ov_eff)}
+    sl = {"week": week, "sims": sims, "df": run_slate(R, S_sl, sched, latest, week, sims, qbs, qbs0, bool((use_ros and not ros_df.empty) or use_depth), inj_df, use_inj, set(weeks)), "ros": bool(use_ros and not ros_df.empty), "ov": len(ov_eff)}
     st.session_state["slate"] = sl
     return sl
 
@@ -2984,7 +3014,7 @@ import re as _re
 
 STAT_COL = {"Pass yds": ["passing_yards"], "Pass TD": ["passing_tds"], "INT": ["interceptions"], "Rush yds": ["rushing_yards"], "Rush TD": ["rushing_tds"],
             "Rec": ["receptions"], "Rec yds": ["receiving_yards"], "Rec TD": ["receiving_tds"], "Anytime TD": ["rushing_tds", "receiving_tds"]}
-BET_COLS = ["id", "profile", "placed_at", "kind", "season", "week", "home", "away", "gameday", "desc", "market", "pick", "line", "odds", "stake", "model_p", "ev", "player", "team", "stat", "status", "pnl", "settled_at"]
+BET_COLS = ["id", "profile", "placed_at", "kind", "season", "week", "home", "away", "gameday", "desc", "market", "pick", "line", "odds", "stake", "model_p", "ev", "player", "team", "stat", "status", "pnl", "settled_at", "legs"]
 
 
 def safe_profile(name):
@@ -3127,7 +3157,11 @@ def grade_bets(bets, sched, pl):
             continue
         hs, as_ = float(g.iloc[0]["home_score"]), float(g.iloc[0]["away_score"])
         res = None
-        if r["kind"] == "game":
+        if r["kind"] == "sgp":
+            res = grade_sgp(r, hs, as_, pl)
+            if res is None:
+                continue
+        elif r["kind"] == "game":
             if r["market"] == "Moneyline":
                 a, o = (hs, as_) if r["pick"] == r["home"] else (as_, hs)
                 res = "won" if a > o else ("push" if a == o else "lost")
@@ -3167,6 +3201,213 @@ def bet_summary(b):
 
 
 # =====================================================================
+# V7: depth chart starters, same-game parlays, game cards
+# =====================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_depth(season):
+    """Latest nflverse depth chart: {team: {pos: [(gsis_id, name), ...]}} in depth order (starter first)."""
+    try:
+        d = to_pandas(nfl.load_depth_charts([int(season)]))
+    except Exception:
+        return {}
+    if d is None or len(d) == 0 or "pos_abb" not in d.columns:
+        return {}
+    d = d[d["pos_abb"].isin(["QB", "RB", "WR", "TE"])].copy()
+    d["team"] = d["team"].replace(FIX)
+    d = d[d["dt"] == d.groupby("team")["dt"].transform("max")]
+    out = {}
+    for (t, pos), g in d.sort_values(["pos_rank", "pos_slot"]).groupby(["team", "pos_abb"]):
+        seen, lst = set(), []
+        for _, r in g.iterrows():
+            key = r.get("gsis_id") or r.get("player_name")
+            if key in seen:
+                continue
+            seen.add(key)
+            lst.append((r.get("gsis_id"), r.get("player_name")))
+        out.setdefault(t, {})[pos] = lst
+    return out
+
+
+def _dc_sort(cands, order):
+    """Players on the depth chart first, in depth order; everyone else keeps their usage order."""
+    by_id = {pid: i for i, (pid, nm) in enumerate(order) if pid}
+    by_nm = {nm: i for i, (pid, nm) in enumerate(order)}
+    def rank(c):
+        i = by_id.get(c.get("pid"))
+        if i is None:
+            i = by_nm.get(c.get("name"))
+        return i
+    ranked = [(rank(c), j, c) for j, c in enumerate(cands)]
+    on = sorted([x for x in ranked if x[0] is not None], key=lambda x: x[0])
+    off = [x for x in ranked if x[0] is None]
+    return [x[2] for x in on] + [x[2] for x in off]
+
+
+def apply_depth(pool, qbs, depth):
+    """Returns copies of the pool and QB lists reordered so the depth-chart starters come first."""
+    p2 = {}
+    for t, by_pos in pool.items():
+        p2[t] = {pos: (_dc_sort(lst, depth.get(t, {}).get(pos, [])) if depth.get(t, {}).get(pos) else list(lst)) for pos, lst in by_pos.items()}
+    q2 = {t: (_dc_sort(lst, depth.get(t, {}).get("QB", [])) if depth.get(t, {}).get("QB") else list(lst)) for t, lst in qbs.items()}
+    return p2, q2
+
+
+def _am_from_dec(dec):
+    dec = max(float(dec), 1.0001)
+    return (dec - 1.0) * 100.0 if dec >= 2.0 else -100.0 / (dec - 1.0)
+
+
+def leg_label(leg):
+    if leg["type"] == "game":
+        if leg["market"] == "Moneyline":
+            return f"{leg['pick']} moneyline"
+        if leg["market"] == "Spread":
+            return f"{leg['pick']} {float(leg['line']):+g}"
+        return f"{leg['pick']} {float(leg['line']):g} total points"
+    return f"{leg['player']} {leg['pick']} {float(leg['line']):g} {leg['stat']}"
+
+
+def leg_outcome(leg, hs, as_, draws, home):
+    """Boolean arrays (win, push) over the simulations for one parlay leg."""
+    hs, as_ = np.asarray(hs), np.asarray(as_)
+    line = float(leg.get("line") or 0.0)
+    if leg["type"] == "game":
+        m, pick = leg["market"], leg["pick"]
+        if m in ("Moneyline", "Spread"):
+            a, b = (hs, as_) if pick == home else (as_, hs)
+            x = a - b + (line if m == "Spread" else 0.0)
+            return x > 0, x == 0
+        t = hs + as_
+        return ((t > line) if pick == "Over" else (t < line)), t == line
+    d = np.asarray(draws[(leg["team"], leg["player"], leg["stat"])])[:len(hs)]
+    return ((d > line) if leg["pick"] == "Over" else (d < line)), d == line
+
+
+def sgp_probs(legs, hs, as_, draws, home):
+    """Joint chances for all legs from the SAME simulated games, so correlation is built in."""
+    n = len(hs)
+    outs = [leg_outcome(l, hs, as_, draws, home) for l in legs]
+    allwin = np.ones(n, bool)
+    anyloss = np.zeros(n, bool)
+    for w, p in outs:
+        allwin &= w
+        anyloss |= ~(w | p)
+    pw = float(allwin.mean())
+    pl_ = float(anyloss.mean())
+    pp = float(1.0 - pw - pl_)
+    singles = [(float(w.mean()), float(p.mean())) for w, p in outs]
+    indep = float(np.prod([s[0] for s in singles])) if singles else 0.0
+    return {"pw": pw, "pp": pp, "pl": pl_, "singles": singles, "indep": indep, "n": n, "n_win": int(allwin.sum())}
+
+
+def grade_sgp(r, hs, as_, pl):
+    """Parlay result from the final score and real player stats: any lost leg loses, every leg won wins, otherwise push."""
+    try:
+        legs = json.loads(r["legs"])
+    except Exception:
+        return None
+    home = r["home"]
+    res = []
+    for lg in legs:
+        line = float(lg.get("line") or 0.0)
+        if lg["type"] == "game":
+            m, pick = lg["market"], lg["pick"]
+            if m in ("Moneyline", "Spread"):
+                a, o = (hs, as_) if pick == home else (as_, hs)
+                x = a - o + (line if m == "Spread" else 0.0)
+                res.append("won" if x > 0 else ("push" if x == 0 else "lost"))
+            else:
+                t = hs + as_
+                res.append("push" if t == line else ("won" if ((t > line) == (pick == "Over")) else "lost"))
+        else:
+            cols = STAT_COL.get(lg["stat"], [])
+            x = pl[(pl["season"] == r["season"]) & (pl["week"] == r["week"]) & (pl["pname"] == lg["player"]) & (pl["tm"] == lg["team"])]
+            if x.empty or not cols:
+                res.append("push")      # player never appeared: the leg is voided
+            else:
+                v = float(sum(x[c].sum() for c in cols if c in x.columns))
+                res.append("push" if v == line else ("won" if ((v > line) == (lg["pick"] == "Over")) else "lost"))
+    if "lost" in res:
+        return "lost"
+    if res and all(s == "won" for s in res):
+        return "won"
+    return "push"
+
+
+def _hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def card_color(t):
+    """Team color, lightened when it would vanish on a dark background."""
+    c = COLORS.get(t, "#4b5563")
+    r, g, b = _hex_rgb(c)
+    lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+    if lum < 0.16:
+        k = 0.30
+        r, g, b = (int(v + (255 - v) * k) for v in (r, g, b))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def spread_text(spread, home, away):
+    if spread is None or (isinstance(spread, float) and np.isnan(spread)):
+        return ""
+    if abs(spread) < 0.01:
+        return "PK"
+    return f"{home} -{abs(spread):g}" if spread > 0 else f"{away} -{abs(spread):g}"
+
+
+def game_card_html(away, home, p_home, sim_a, sim_h, spread=None, total=None, mkt_p=None, qb_a=None, qb_h=None, date=""):
+    ca, ch = card_color(away), card_color(home)
+    pa = (1 - p_home) * 100
+    ph = p_home * 100
+    fav = home if p_home >= 0.5 else away
+    tag = ""
+    if mkt_p is not None and not (isinstance(mkt_p, float) and np.isnan(mkt_p)):
+        d = (p_home - mkt_p) * 100
+        if abs(d) >= 4:
+            side = home if d > 0 else away
+            tag = f'<span class="g7tag">Model vs market: {side} +{abs(d):.0f} pts win chance</span>'
+    sp = spread_text(spread, home, away)
+    bits = []
+    if sp:
+        bits.append(f"Line {sp}")
+    if total is not None and not (isinstance(total, float) and np.isnan(total)):
+        bits.append(f"O/U {float(total):g}")
+    bits.append(f"Sim {away} {sim_a:.0f} - {home} {sim_h:.0f}")
+    qbs = ""
+    if qb_a or qb_h:
+        qbs = f'<div class="g7sub">QB: {qb_a or "?"} / {qb_h or "?"}</div>'
+    return (f'<div class="g7card" style="background:linear-gradient(100deg,{ca}d9 0%,#0f172a 46%,#0f172a 54%,{ch}d9 100%)">'
+            f'<div class="g7top"><span>{date}</span><span>{fav} favored</span></div>'
+            f'<div class="g7row"><div class="g7team">{away}<small>{pa:.0f}%</small></div><div class="g7at">@</div><div class="g7team r">{home}<small>{ph:.0f}%</small></div></div>'
+            f'<div class="g7bar"><i style="width:{pa:.1f}%;background:{ca}"></i><i style="width:{ph:.1f}%;background:{ch}"></i></div>'
+            f'<div class="g7sub">{"  |  ".join(bits)}</div>{qbs}{tag}</div>')
+
+
+G7_CSS = """
+<style>
+.g7grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:.7rem;margin:.4rem 0 1rem}
+.g7card{border-radius:14px;padding:.75rem .9rem;color:#f8fafc;border:1px solid rgba(255,255,255,.08);box-shadow:0 2px 10px rgba(0,0,0,.35)}
+.g7top{display:flex;justify-content:space-between;font-size:.72rem;opacity:.8;letter-spacing:.03em;text-transform:uppercase}
+.g7row{display:flex;align-items:center;justify-content:space-between;margin:.35rem 0 .45rem}
+.g7team{font-size:1.55rem;font-weight:800;line-height:1.05;text-shadow:0 1px 3px rgba(0,0,0,.6)}
+.g7team small{display:block;font-size:.95rem;font-weight:700;opacity:.92}
+.g7team.r{text-align:right}
+.g7at{opacity:.55;font-weight:700}
+.g7bar{display:flex;height:7px;border-radius:5px;overflow:hidden;background:#1e293b}
+.g7bar i{display:block;height:100%}
+.g7sub{font-size:.78rem;opacity:.85;margin-top:.45rem}
+.g7tag{display:inline-block;margin-top:.5rem;padding:.12rem .55rem;border-radius:999px;background:rgba(250,204,21,.16);color:#fde68a;font-size:.72rem;font-weight:600;border:1px solid rgba(250,204,21,.35)}
+.g7hero{padding:1rem 1.1rem}
+.g7hero .g7team{font-size:2.3rem}
+@media (max-width:640px){.g7grid{grid-template-columns:1fr}.g7hero .g7team{font-size:1.9rem}}
+</style>
+"""
+
+
+# =====================================================================
 # APP
 # =====================================================================
 sched, pl, seasons = load_data()
@@ -3183,6 +3424,7 @@ S_all = load_style(latest, version)
 
 CSS = '\n<style>\n.block-container{padding-top:3.6rem;padding-bottom:4rem;max-width:1240px}\nh1{font-size:1.7rem !important;padding:0 0 .2rem 0 !important}\ndiv[data-testid="stMetricValue"]{font-size:1.6rem}\n.st-key-matchbar [data-testid="stHorizontalBlock"]{flex-wrap:nowrap !important;gap:.6rem}\n.st-key-matchbar [data-testid="stColumn"]{min-width:0 !important;width:auto !important;flex:1 1 0 !important}\n.st-key-matchbar [data-testid="stButton"] button{width:100%;font-weight:700}\n.st-key-matchbar div[data-testid="stButton"]{width:100%}\n.stTabs [data-baseweb="tab-list"]{gap:.15rem;overflow-x:auto}\n.stTabs [data-baseweb="tab"]{padding:.45rem .8rem;white-space:nowrap}\n[class*="st-key-kpis"] [data-testid="stHorizontalBlock"]{flex-wrap:wrap !important}\n@media (max-width:640px){\n  [class*="st-key-kpis"] [data-testid="stColumn"]{min-width:calc(50% - .5rem) !important;flex:1 1 calc(50% - .5rem) !important;width:auto !important}\n  .block-container{padding:3.3rem .55rem 4rem}\n  .st-key-topcap{display:none}\n  h1{font-size:1.35rem !important}\n  div[data-testid="stMetricValue"]{font-size:1.15rem}\n  div[data-testid="stMetricLabel"]{font-size:.72rem}\n  .stTabs [data-baseweb="tab"]{padding:.4rem .55rem;font-size:.85rem}\n  div[data-testid="stHorizontalBlock"]{gap:.4rem}\n  .stButton>button,.stDownloadButton>button{width:100%;min-height:2.6rem}\n  div[data-testid="stDataFrame"]{font-size:.8rem}\n}\n</style>\n'
 st.markdown(CSS, unsafe_allow_html=True)
+st.markdown(G7_CSS, unsafe_allow_html=True)
 st.title("🏈 NFL Simulator")
 with st.container(key="topcap"):
     st.caption(f"{seasons[0]}-{seasons[-1]} data, {version:,} completed games. Simulate any game, watch it play out on the field, and track your predictions and bets.")
@@ -3198,7 +3440,7 @@ t_game, t_field, t_players, t_bets, t_week, t_season, t_teams, t_setup = st.tabs
 with t_players:
     tab_players, tab_box, tab_pbp = st.tabs(["Projections", "Box score", "Plays"])
 with t_bets:
-    tab_props, tab_slip, tab_mybets, tab_bet, tab_track = st.tabs(["Props board", "Place a bet", "My bets", "Value finder", "Model picks"])
+    tab_props, tab_slip, tab_sgp, tab_mybets, tab_bet, tab_track = st.tabs(["Props board", "Place a bet", "Parlay", "My bets", "Value finder", "Model picks"])
 with t_teams:
     tab_bt, tab_roster, tab_inj, tab_style, tab_ratings = st.tabs(["Backtest", "Rosters", "Injuries", "Team style", "Ratings"])
 tab_game, tab_anim, tab_slate, tab_season, tab_drives = t_game, t_field, t_week, t_season, tab_pbp
@@ -3252,6 +3494,14 @@ with t_setup:
         pool, qbs = rehome_pool(pool0, rst_eff, set(ov_eff)), rehome_qbs(qbs0, rst_eff, set(ov_eff))
         st.caption(f"Rosters as of week {ros_week} (rechecked hourly)" + (f", plus {len(ov_eff)} manual move(s)." if ov_eff else "."))
 
+    depth = load_depth(latest)
+    use_depth = st.checkbox("Use depth chart starters", value=bool(depth), disabled=not depth, help="Puts each team's official depth chart starters first: the QB, the top RB, the top three WRs and the TE. Players who are Out or Doubtful are still skipped for the next man up.")
+    if not depth:
+        st.caption("The depth chart could not be loaded right now, so lineups use recent usage.")
+    elif use_depth:
+        pool, qbs = apply_depth(pool, qbs, depth)
+        st.caption("Default lineups follow the latest nflverse depth chart (rechecked hourly). You can still change any lineup below.")
+
     st.subheader("Injuries")
     weeks = sorted(int(w) for w in inj_df["week"].dropna().unique()) if len(inj_df) else []
     gw = game_week(sched, latest, home, away)
@@ -3294,7 +3544,7 @@ with t_setup:
                 di = i
                 break
         choice = st.selectbox(f"{team} quarterback", labels, index=di, key=f"qb_{side}_{team}_{wk_key}")
-        base_list = qbs0.get(team, []) if use_ros else mine
+        base_list = qbs0.get(team, []) if (use_ros or use_depth) else mine
         return plist[labels.index(choice)], (base_list[0] if base_list else (mine[0] if mine else plist[0]))
 
     qb_h, s0_h = pick_qb(home, "home")
@@ -3390,7 +3640,7 @@ with tab_slate:
     if not open_weeks:
         st.info("There are no unplayed games left on this season's schedule.")
     else:
-        st.caption("Simulates every game in a week at once using the same settings as the sidebar (ratings, team style, current rosters, and each team's default quarterback from the injury report). Skill players don't change the score, so the slate only needs the QB. Lines come from the schedule data when they are posted.")
+        st.caption("Simulates every game in a week at once using the same settings as the Setup tab (ratings, team style, current rosters, depth chart, and each team's default quarterback from the injury report). Skill players don't change the score, so the slate only needs the QB. Lines come from the schedule data when they are posted.")
         s1, s2 = st.columns([1, 1])
         sl_week = s1.selectbox("Week", open_weeks, index=0, key="slate_week")
         sl_sims = s2.select_slider("Simulations per game", [2000, 5000, 10000, 20000], value=5000, key="slate_sims")
@@ -3408,6 +3658,9 @@ with tab_slate:
             else:
                 if (sdf["Injury report"] == "not posted yet").all():
                     st.caption("The injury report for this week isn't posted yet, so default lineups only reflect the rosters. Re-run after the report comes out (usually Wednesday or Thursday).")
+                _cards = "".join(game_card_html(r["_away"], r["_home"], r["_p_home"], (r["_sim_t"] - r["_sim_m"]) / 2, (r["_sim_t"] + r["_sim_m"]) / 2, r.get("_spread"), r.get("_total"), r.get("_mkt_p"),
+                                                 r.get("_qb_a"), r.get("_qb_h"), str(r.get("Date", ""))) for r in sdf.to_dict("records"))
+                st.markdown('<div class="g7grid">' + _cards + '</div>', unsafe_allow_html=True)
                 cfg = {
                     "Home win %": st.column_config.NumberColumn(format="%.1f"),
                     "Sim margin (home)": st.column_config.NumberColumn(format="%.1f", help="Average home-team margin in the simulations"),
@@ -3789,7 +4042,7 @@ def show_math(pw, pp, pl, odds, stake, bankroll, frac):
 
 
 if res is None:
-    for t in (tab_game, tab_anim, tab_box, tab_pbp, tab_players, tab_props, tab_slip):
+    for t in (tab_game, tab_anim, tab_box, tab_pbp, tab_players, tab_props, tab_slip, tab_sgp):
         with t:
             st.info("Pick the two teams at the top and press Simulate game.")
 else:
@@ -3798,6 +4051,10 @@ else:
         hs, as_ = res["game"]["hs"], res["game"]["as"]
         for note in res["notes"]:
             st.info(note)
+        _mk = res.get("line") or {}
+        _ph = float((res["game"]["hs"] > res["game"]["as"]).mean())
+        st.markdown(game_card_html(a, h, _ph, float(res["game"]["as"].mean()), float(res["game"]["hs"].mean()), _mk.get("spread"), _mk.get("total"), _mk.get("p_home"),
+                                   date="Neutral site" if res.get("neutral") else "Home field: " + h).replace('class="g7card"', 'class="g7card g7hero"'), unsafe_allow_html=True)
         with st.container(key="kpis_game"):
             c1, c2, c3, c4 = st.columns(4)
             c1.metric(f"{a} win", f"{(as_ > hs).mean() * 100:.1f}%")
@@ -3941,6 +4198,102 @@ else:
                         "gameday": str(gm["gameday"]) if gm is not None else None, "odds": float(odds), "stake": float(stake), "model_p": float(pw), "ev": float(m["ev"])})
             ok = add_bet(prof, row)
             st.success("Saved to My bets." + ("" if ok else " (Kept in this session only; the file could not be written.)"))
+
+    with tab_sgp:
+        prof = safe_profile(st.session_state.get("bet_profile", "me"))
+        bankroll = float(st.session_state.get("bet_bank0", 1000.0))
+        frac = float(st.session_state.get("bet_frac", 0.25))
+        gm = find_any_game(sched, latest, h, a)
+        mk = res.get("line")
+        if not draws:
+            st.info("No player projections for this game, so only game legs are available.")
+        n_sim = min([len(res["game"]["hs"])] + [len(v) for v in draws.values()]) if draws else len(res["game"]["hs"])
+        HS, AS = np.asarray(res["game"]["hs"])[:n_sim], np.asarray(res["game"]["as"])[:n_sim]
+        st.caption(f"Build a same-game parlay for {a} @ {h}. All legs are scored on the same {n_sim:,} simulated games, so legs that move together (a team winning and its QB throwing for a lot) are priced as a group, not as separate coin flips. "
+                   "Only the game score and a shared passing-game factor link the players, so treat the correlation as a rough guide, not what a sportsbook's own model would price.")
+        legs = st.session_state.setdefault(f"sgp_legs_{h}_{a}", [])
+        lk = st.radio("Add a leg", ["Game", "Player prop"], horizontal=True, key="sgp_kind")
+        new_leg = None
+        if lk == "Game":
+            gmk = st.selectbox("Bet type", ["Moneyline", "Spread", "Total points"], key="sgp_market")
+            if gmk == "Total points":
+                gp = st.radio("Pick", ["Over", "Under"], horizontal=True, key="sgp_pick_t")
+                dl = float(mk["total"]) if mk and mk.get("total") is not None else float(np.round((HS + AS).mean() * 2) / 2)
+                gl = st.number_input("Total", value=dl, step=0.5, key=f"sgp_line_t_{dl}")
+                new_leg = {"type": "game", "market": "Total", "pick": gp, "line": float(gl)}
+            else:
+                gp = st.radio("Pick", [h, a], horizontal=True, key=f"sgp_pick_{gmk}")
+                if gmk == "Spread":
+                    base = (-float(mk["spread"]) if gp == h else float(mk["spread"])) if mk and mk.get("spread") is not None else 0.0
+                    gl = st.number_input(f"{gp} spread (as the sportsbook shows it, e.g. -3.5 or +7)", value=base, step=0.5, key=f"sgp_line_{gp}_{base}")
+                else:
+                    gl = 0.0
+                new_leg = {"type": "game", "market": gmk, "pick": gp, "line": float(gl)}
+        elif draws:
+            opts = sorted({(t, nme) for (t, nme, s_) in draws}, key=lambda z: (z[0], z[1]))
+            who = st.selectbox("Player", [f"{nme} ({t})" for t, nme in opts], key="sgp_player")
+            pn, pt = who.rsplit(" (", 1)[0], who.rsplit(" (", 1)[1][:-1]
+            stats = [s_ for (t, nme, s_) in draws if t == pt and nme == pn]
+            stat = st.selectbox("Stat", stats, key=f"sgp_stat_{who}")
+            dd = draws[(pt, pn, stat)]
+            side = st.radio("Pick", ["Over", "Under"], horizontal=True, key="sgp_side")
+            pl_line = st.number_input("Line", value=0.5 if stat == "Anytime TD" else best_line(dd), step=0.5, key=f"sgp_pline_{who}_{stat}")
+            new_leg = {"type": "prop", "player": pn, "team": pt, "stat": stat, "pick": side, "line": float(pl_line)}
+        if new_leg is not None and st.button("Add this leg", key="sgp_add_leg"):
+            new_leg["label"] = leg_label(new_leg)
+            if new_leg["label"] not in [l["label"] for l in legs]:
+                legs.append(new_leg)
+            st.rerun()
+        if not legs:
+            st.info("Add two or more legs to price the parlay.")
+        else:
+            for i, lg in enumerate(list(legs)):
+                c1, c2 = st.columns([5, 1])
+                c1.write(f"{i + 1}. {lg['label']}")
+                if c2.button("Remove", key=f"sgp_rm_{i}"):
+                    legs.pop(i)
+                    st.rerun()
+            if st.button("Clear all legs", key="sgp_clear"):
+                legs.clear()
+                st.rerun()
+        if len(legs) >= 1:
+            sp = sgp_probs(legs, HS, AS, draws, h)
+            tbl = pd.DataFrame({"Leg": [l["label"] for l in legs], "Win %": [s[0] * 100 for s in sp["singles"]]})
+            st.dataframe(tbl, hide_index=True, column_config={"Win %": st.column_config.NumberColumn(format="%.1f")})
+        if len(legs) >= 2:
+            lift = sp["pw"] / sp["indep"] if sp["indep"] > 0 else float("nan")
+            kc = st.container(key="kpis_sgp")
+            c = kc.columns(4)
+            c[0].metric("Parlay win chance", f"{sp['pw'] * 100:.2f}%", help=f"All legs hit in {sp['n_win']:,} of {sp['n']:,} simulated games")
+            c[1].metric("If legs were independent", f"{sp['indep'] * 100:.2f}%", help="Each leg's win chance multiplied together, the way a naive parlay is priced")
+            c[2].metric("Correlation lift", f"{lift:.2f}x" if lift == lift else "n/a", help="Above 1 means the legs tend to happen together; below 1 means they pull against each other")
+            c[3].metric("Fair odds", f"{_am_from_dec(1.0 / sp['pw']):+,.0f}" if sp["pw"] > 0 else "n/a", help="The American price at which this parlay would be a break-even bet according to the model")
+            if sp["n_win"] < 30:
+                st.warning(f"Only {sp['n_win']} of {sp['n']:,} simulated games hit every leg, so this number is shaky. A rare combination needs more simulations than this tab has.")
+            naive = _am_from_dec(1.909 ** len(legs))
+            odds = st.number_input("Odds the book offers for this parlay (American)", value=float(round(naive / 5.0) * 5.0), step=5.0, key=f"sgp_odds_{len(legs)}_{'|'.join(l['label'] for l in legs)}",
+                                   help="The default is what separate -110 legs would pay. Type the real price from your book.")
+            stake = st.number_input("Stake ($)", min_value=1.0, value=10.0, step=5.0, key="sgp_stake")
+            m = bet_math(sp["pw"], sp["pp"], sp["pl"], odds, stake, bankroll, frac)
+            kc2 = st.container(key="kpis_sgp2")
+            d2 = kc2.columns(4)
+            d2[0].metric("Break-even chance", f"{m['be'] * 100:.2f}%")
+            d2[1].metric("Profit per $100 (model)", f"{m['ev'] * 100:+.1f}")
+            d2[2].metric("To win", f"${m['to_win']:,.2f}")
+            d2[3].metric("Kelly stake", f"${m['stake_k']:,.0f}" if m["kelly"] > 0 else "$0")
+            st.caption("Parlays carry a big built-in house edge, and this model trails the market (see the Backtest). Treat a positive number as a reason to look closer, not a signal to bet. A pushed leg here counts as a push for the whole parlay; a sportsbook would usually drop that leg and pay the rest.")
+            if gm is None:
+                st.warning(f"{a} @ {h} isn't on this season's schedule, so this parlay can't be graded automatically.")
+            elif pd.notna(gm["home_score"]):
+                st.warning(f"{gm['away_team']} @ {gm['home_team']} (week {int(gm['week'])}) has already been played, so a parlay added now will grade right away from the real result.")
+            if st.button("Add parlay to my bets", type="primary", key="sgp_save"):
+                row = {"kind": "sgp", "market": "SGP", "pick": f"{len(legs)} legs", "line": None, "player": None, "team": None, "stat": None, "desc": "SGP: " + " + ".join(l["label"] for l in legs),
+                       "legs": json.dumps(legs), "season": int(latest), "week": int(gm["week"]) if gm is not None else None, "home": gm["home_team"] if gm is not None else h,
+                       "away": gm["away_team"] if gm is not None else a, "gameday": str(gm["gameday"]) if gm is not None else None, "odds": float(odds), "stake": float(stake),
+                       "model_p": float(sp["pw"]), "ev": float(m["ev"])}
+                ok = add_bet(prof, row)
+                st.success("Parlay saved to My bets." + ("" if ok else " (Kept in this session only; the file could not be written.)"))
+
 
 with tab_mybets:
     mc1, mc2, mc3 = st.columns(3)
