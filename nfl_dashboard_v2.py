@@ -2146,7 +2146,8 @@ function drawAction(tm){
     const isO = e.side === 'o', team = isO ? p.team : p.opp, col = colOf(team);
     cx.beginPath(); cx.arc(a[0], a[1], R, 0, 7); cx.fillStyle = col; cx.fill();
     cx.lineWidth = (holder && holder.e === e) ? 3 : 1.6; cx.strokeStyle = (holder && holder.e === e) ? '#f5c518' : (isO ? '#fff' : 'rgba(0,0,0,.55)'); cx.stroke();
-    const lab = e.tag || (isO ? (e.role.startsWith('OL') ? '' : e.role.replace(/[0-9]/g, '')) : e.role);
+    const jn = (isO && G.nums) ? G.nums[e.name] : null;
+    const lab = e.tag || (jn ? String(jn) : (isO ? (e.role.startsWith('OL') ? '' : e.role.replace(/[0-9]/g, '')) : e.role));
     if (lab){ cx.fillStyle = '#fff'; cx.font = 'bold ' + Math.round(R * .85) + 'px system-ui'; cx.textAlign = 'center'; cx.textBaseline = 'middle'; cx.fillText(lab, a[0], a[1] + .5); }
     if (selected === e){ cx.strokeStyle = '#4da3ff'; cx.lineWidth = 3; cx.beginPath(); cx.arc(a[0], a[1], R + 4, 0, 7); cx.stroke(); }
   });
@@ -2338,9 +2339,11 @@ def field_payload(g, plays, prep, pre=0.0):
     return {"home": h, "away": a, "hc": hc, "ac": ac, "plays": out, "wp": wp, "rost": rost}
 
 
-def build_field_html(g, prep, pre=0.0, plays=None):
+def build_field_html(g, prep, pre=0.0, plays=None, nums=None):
     plays = plays if plays is not None else expand_game(g, prep)
-    data = json.dumps(field_payload(g, plays, prep, pre)).replace("</", "<\\/")
+    _pl = field_payload(g, plays, prep, pre)
+    _pl["nums"] = nums or {}
+    data = json.dumps(_pl).replace("</", "<\\/")
     return FIELD_HTML.replace("__DATA__", data)
 
 
@@ -2485,7 +2488,7 @@ def default_qb(team, qbs_use, qbs_base, inj_map, use_ros):
     return pick, s0, adj
 
 
-def run_slate(R, S_use, sched, season, week, sims, qbs_use, qbs_base, use_ros, inj_df, use_inj, inj_weeks):
+def run_slate(R, S_use, sched, season, week, sims, qbs_use, qbs_base, use_ros, inj_df, use_inj, inj_weeks, situ=None):
     g = sched[(sched["season"] == season) & (sched["week"] == week) & sched["home_score"].isna()].sort_values(["gameday", "home_team"])
     rows = []
     for r in g.to_dict("records"):
@@ -2497,7 +2500,8 @@ def run_slate(R, S_use, sched, season, week, sims, qbs_use, qbs_base, use_ros, i
         im = {t: (inj_lookup(inj_df, t, week) if have_inj else {}) for t in (h, a)}
         qh, s0h, ah = default_qb(h, qbs_use, qbs_base, im[h], use_ros)
         qa, s0a, aa = default_qb(a, qbs_use, qbs_base, im[a], use_ros)
-        game = simulate_game(R, S_use, h, a, sims, neutral, {h: ah, a: aa})
+        sa, sn = situ_adj(situ, r, h, a, neutral)
+        game = simulate_game(R, S_use, h, a, sims, neutral, {h: ah + sa.get(h, 0.0), a: aa + sa.get(a, 0.0)})
         hs, as_ = game["hs"], game["as"]
         mk = market_from_row(r)
         sim_m, sim_t, sim_p = float((hs - as_).mean()), float((hs + as_).mean()), float((hs > as_).mean())
@@ -2512,6 +2516,7 @@ def run_slate(R, S_use, sched, season, week, sims, qbs_use, qbs_base, use_ros, i
                 return f"{t}: ?"
             return f"{t}: {q['name']}" + (f" ({adj:+.1f})" if (s0 is not None and q['pid'] != s0['pid']) else "")
         row["QBs used"] = qtxt(a, qa, s0a, aa) + "  |  " + qtxt(h, qh, s0h, ah)
+        row["Rest & travel"] = "; ".join(sn)
         pr0 = line_probs(hs, as_, mk["spread"] if mk else None, mk["total"] if mk else None)
         row.update({"_home": h, "_away": a, "_gameday": str(r.get("gameday", "")), "_p_home": sim_p, "_sim_m": sim_m, "_sim_t": sim_t, "_spread": mk["spread"] if mk else None, "_total": mk["total"] if mk else None,
                     "_ml_h": mk["ml_home"] if mk else None, "_ml_a": mk["ml_away"] if mk else None, "_mkt_p": mk["p_home"] if mk else None,
@@ -3002,7 +3007,7 @@ def units_110(rec):
 
 def compute_slate(week, sims):
     S_sl = S_all if (use_style and S_all) else None
-    sl = {"week": week, "sims": sims, "df": run_slate(R, S_sl, sched, latest, week, sims, qbs, qbs0, bool((use_ros and not ros_df.empty) or use_depth), inj_df, use_inj, set(weeks)), "ros": bool(use_ros and not ros_df.empty), "ov": len(ov_eff)}
+    sl = {"week": week, "sims": sims, "df": run_slate(R, S_sl, sched, latest, week, sims, qbs, qbs0, bool((use_ros and not ros_df.empty) or use_depth), inj_df, use_inj, set(weeks), dict(SITU, apply=use_situ)), "ros": bool(use_ros and not ros_df.empty), "ov": len(ov_eff)}
     st.session_state["slate"] = sl
     return sl
 
@@ -3358,7 +3363,7 @@ def spread_text(spread, home, away):
     return f"{home} -{abs(spread):g}" if spread > 0 else f"{away} -{abs(spread):g}"
 
 
-def game_card_html(away, home, p_home, sim_a, sim_h, spread=None, total=None, mkt_p=None, qb_a=None, qb_h=None, date=""):
+def game_card_html(away, home, p_home, sim_a, sim_h, spread=None, total=None, mkt_p=None, qb_a=None, qb_h=None, date="", note=""):
     ca, ch = card_color(away), card_color(home)
     pa = (1 - p_home) * 100
     ph = p_home * 100
@@ -3370,6 +3375,7 @@ def game_card_html(away, home, p_home, sim_a, sim_h, spread=None, total=None, mk
             side = home if d > 0 else away
             tag = f'<span class="g7tag">Model vs market: {side} +{abs(d):.0f} pts win chance</span>'
     sp = spread_text(spread, home, away)
+    nt = f'<div class="g7sub">{note}</div>' if note else ""
     bits = []
     if sp:
         bits.append(f"Line {sp}")
@@ -3383,7 +3389,7 @@ def game_card_html(away, home, p_home, sim_a, sim_h, spread=None, total=None, mk
             f'<div class="g7top"><span>{date}</span><span>{fav} favored</span></div>'
             f'<div class="g7row"><div class="g7team">{away}<small>{pa:.0f}%</small></div><div class="g7at">@</div><div class="g7team r">{home}<small>{ph:.0f}%</small></div></div>'
             f'<div class="g7bar"><i style="width:{pa:.1f}%;background:{ca}"></i><i style="width:{ph:.1f}%;background:{ch}"></i></div>'
-            f'<div class="g7sub">{"  |  ".join(bits)}</div>{qbs}{tag}</div>')
+            f'<div class="g7sub">{"  |  ".join(bits)}</div>{qbs}{nt}{tag}</div>')
 
 
 G7_CSS = """
@@ -3405,6 +3411,581 @@ G7_CSS = """
 @media (max-width:640px){.g7grid{grid-template-columns:1fr}.g7hero .g7team{font-size:1.9rem}}
 </style>
 """
+
+
+# =====================================================================
+# V8: REST, BYE WEEKS AND TRAVEL (learned from past games)
+# =====================================================================
+TEAM_XY = {"ARI": (33.53, -112.26), "ATL": (33.76, -84.40), "BAL": (39.28, -76.62), "BUF": (42.77, -78.79), "CAR": (35.23, -80.85), "CHI": (41.86, -87.62), "CIN": (39.10, -84.52),
+           "CLE": (41.51, -81.70), "DAL": (32.75, -97.09), "DEN": (39.74, -105.02), "DET": (42.34, -83.05), "GB": (44.50, -88.06), "HOU": (29.68, -95.41), "IND": (39.76, -86.16),
+           "JAX": (30.32, -81.64), "KC": (39.05, -94.48), "LA": (33.95, -118.34), "LAC": (33.95, -118.34), "LV": (36.09, -115.18), "MIA": (25.96, -80.24), "MIN": (44.97, -93.26),
+           "NE": (42.09, -71.26), "NO": (29.95, -90.08), "NYG": (40.81, -74.07), "NYJ": (40.81, -74.07), "PHI": (39.90, -75.17), "PIT": (40.45, -80.02), "SEA": (47.60, -122.33),
+           "SF": (37.40, -121.97), "TB": (27.98, -82.50), "TEN": (36.17, -86.77), "WAS": (38.91, -76.86)}
+
+
+def trip_miles(away, home):
+    a, h = TEAM_XY.get(away), TEAM_XY.get(home)
+    if not a or not h:
+        return 0.0
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], h[0], h[1]))
+    d = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 3959.0 * 2 * math.asin(math.sqrt(d))
+
+
+def trip_tz_east(away, home):
+    """Time zones the visiting team crosses going east (0 if it travels west or stays level)."""
+    a, h = TEAM_XY.get(away), TEAM_XY.get(home)
+    if not a or not h:
+        return 0.0
+    return float(min(max((h[1] - a[1]) / 15.0, 0.0), 3.0))
+
+
+def _wols(X, y, w):
+    Xw, yw = X * np.sqrt(w)[:, None], y * np.sqrt(w)
+    b = np.linalg.lstsq(Xw, yw, rcond=None)[0]
+    e = yw - Xw @ b
+    s2 = float(e @ e) / max(len(y) - X.shape[1], 1)
+    se = np.sqrt(np.diag(s2 * np.linalg.pinv(Xw.T @ Xw)))
+    return b, se
+
+
+@st.cache_data(show_spinner=False)
+def situ_fit(_sched, _R, version, decay, alpha):
+    """Measures from past games how much a bye week, a short week, travel distance and time zones moved the final margin beyond what the team ratings predict."""
+    p = _sched.dropna(subset=["home_score", "away_score"]).copy()
+    p = p[p["location"].astype(str).str.lower() != "neutral"]
+    p = p[p["home_team"].isin(_R["off"]) & p["away_team"].isin(_R["off"]) & p["home_rest"].notna() & p["away_rest"].notna()]
+    out = {"coef": 0.0, "n": int(len(p)), "rows": [], "applied": 0.0}
+    if len(p) < 400:
+        return out
+    ha = _R["home_adv"]
+    mu_h = _R["league_avg"] + p["home_team"].map(_R["off"]) + p["away_team"].map(_R["dfn"]) + ha
+    mu_a = _R["league_avg"] + p["away_team"].map(_R["off"]) + p["home_team"].map(_R["dfn"]) - ha
+    y = ((p["home_score"] - p["away_score"]) - (mu_h - mu_a)).values.astype(float)
+    hr, ar = p["home_rest"].astype(float).values, p["away_rest"].astype(float).values
+    w = decay ** (int(p["season"].max()) - p["season"].values)
+    feats = {
+        "Bye week (home off a bye minus away off a bye)": ((hr >= 10).astype(float) - (ar >= 10).astype(float)),
+        "Short week (home on short rest minus away)": ((hr <= 5).astype(float) - (ar <= 5).astype(float)),
+        "Visitor's trip, per 1,000 miles": np.array([trip_miles(a_, h_) for a_, h_ in zip(p["away_team"], p["home_team"])]) / 1000.0,
+        "Visitor flies east, per time zone": np.array([trip_tz_east(a_, h_) for a_, h_ in zip(p["away_team"], p["home_team"])]),
+    }
+    rows = []
+    for name, x in feats.items():
+        X = np.column_stack([np.ones(len(x)), x])
+        b, se = _wols(X, y, w)
+        rows.append({"Factor": name, "Points for the home side": float(b[1]), "Std. error": float(se[1]), "Games with it": int((x != 0).sum())})
+    # the amount applied comes from season-by-season estimates of the bye effect (completed seasons only), damped
+    xb = feats["Bye week (home off a bye minus away off a bye)"]
+    per = []
+    seas = p["season"].values
+    for s_ in sorted(set(seas)):
+        m_ = seas == s_
+        if m_.sum() >= 200 and (xb[m_] != 0).sum() >= 40 and s_ < int(p["season"].max()):
+            per.append(float(xb[m_] @ y[m_]) / float(xb[m_] @ xb[m_]))
+    k = float(np.mean(per)) if per else 0.0
+    t = (k / (np.std(per, ddof=1) / math.sqrt(len(per)))) if len(per) >= 4 and np.std(per, ddof=1) > 0 else 0.0
+    use = max(0.0, min(1.5, 0.8 * k)) if t > 1.5 else 0.0
+    rows[0]["Typical season"] = k
+    for r_ in rows[1:]:
+        r_["Typical season"] = None
+    k = rows[0]["Points for the home side"]
+    out.update({"coef": float(k), "applied": float(use), "rows": rows})
+    return out
+
+
+def situ_adj(situ, row, home, away, neutral):
+    """Points to move each team's expected score (home +, away -) plus plain-English notes."""
+    adj, notes = {}, []
+    if situ is None:
+        return adj, notes
+    hr = ar = None
+    if row is not None:
+        try:
+            hr, ar = float(row["home_rest"]), float(row["away_rest"])
+        except Exception:
+            hr = ar = None
+    m = 0.0
+    if hr is not None and not (math.isnan(hr) or math.isnan(ar)):
+        hb, ab = hr >= 10, ar >= 10
+        if hb:
+            notes.append(f"{home} off a bye")
+        if ab:
+            notes.append(f"{away} off a bye")
+        for t, r_ in ((home, hr), (away, ar)):
+            if r_ <= 5:
+                notes.append(f"{t} on a short week ({int(r_)} days)")
+        m = situ.get("applied", 0.0) * (float(hb) - float(ab)) if situ.get("apply", True) else 0.0
+        if m:
+            adj = {home: m / 2.0, away: -m / 2.0}
+            notes[0:0] = []
+    if not neutral:
+        mi, tz = trip_miles(away, home), trip_tz_east(away, home)
+        if mi >= 1500 or tz >= 2:
+            notes.append(f"{away} travels {mi:,.0f} miles" + (f", {tz:.0f} time zones east" if tz >= 2 else ""))
+    return adj, notes
+
+
+# =====================================================================
+# V8: PICKS OF THE WEEK, STORAGE, BEAT THE BOT PICK'EM
+# =====================================================================
+import base64 as _b64
+from datetime import datetime as _dt, timezone as _tz
+
+
+def weekly_picks(sdf):
+    """Lock, Upset alert and Coin flip for a simulated week."""
+    if sdf is None or len(sdf) == 0:
+        return {}
+    d = sdf.copy()
+    d["_side"] = np.where(d["_p_home"] >= 0.5, d["_home"], d["_away"])
+    d["_conf"] = np.maximum(d["_p_home"], 1 - d["_p_home"])
+    out = {}
+    lk = d.sort_values("_conf", ascending=False).iloc[0]
+    out["lock"] = lk
+    cf = d.assign(_gap=(d["_p_home"] - 0.5).abs()).sort_values("_gap").iloc[0]
+    out["coin"] = cf
+    ups = d[d["_mkt_p"].notna()].copy()
+    if len(ups):
+        mk_side = np.where(ups["_p_home"] >= 0.5, ups["_mkt_p"], 1 - ups["_mkt_p"])
+        ups["_edge"] = np.where(ups["_p_home"] >= 0.5, ups["_p_home"], 1 - ups["_p_home"]) - mk_side
+        ups = ups[mk_side < 0.5].sort_values("_edge", ascending=False)
+        if len(ups):
+            out["upset"] = ups.iloc[0]
+    return out
+
+
+def pick_card_html(kind, r):
+    side = r["_side"] if "_side" in r.index else (r["_home"] if r["_p_home"] >= 0.5 else r["_away"])
+    p_side = r["_p_home"] if side == r["_home"] else 1 - r["_p_home"]
+    title = {"lock": "LOCK OF THE WEEK", "upset": "UPSET ALERT", "coin": "COIN FLIP"}[kind]
+    icon = {"lock": "&#128274;", "upset": "&#9888;&#65039;", "coin": "&#129689;"}[kind]
+    why = {"lock": f"The model's most confident pick: {p_side * 100:.0f}% to win.",
+           "upset": f"The market has {side} as the underdog ({(1 - r['_mkt_p'] if side == r['_away'] else r['_mkt_p']) * 100:.0f}%), but the model gives {side} {p_side * 100:.0f}%.",
+           "coin": f"As close as it gets: {r['_home']} {r['_p_home'] * 100:.0f}% / {r['_away']} {(1 - r['_p_home']) * 100:.0f}%."}[kind]
+    col = card_color(side)
+    return (f'<div class="g7card" style="background:linear-gradient(120deg,{col}d9 0%,#0f172a 70%)"><div class="g7top"><span>{icon} {title}</span><span>{r["Date"]}</span></div>'
+            f'<div class="g7row"><div class="g7team">{side}<small>{r["_away"]} @ {r["_home"]}</small></div></div><div class="g7sub">{why}</div></div>')
+
+
+# ---- storage: a data branch on GitHub when a token is set, otherwise a local file ----------------
+PICKEM_FILE = "nfl_pickem.csv"
+PICKEM_COLS = ["saved_at", "season", "week", "player", "home", "away", "pick"]
+GH_BRANCH = "pickem-data"
+
+
+def _secret(name, default=None):
+    try:
+        v = st.secrets.get(name, default)
+        return v if v not in ("", None) else default
+    except Exception:
+        return default
+
+
+def _gh_cfg():
+    tok, repo = _secret("GH_TOKEN"), _secret("GH_REPO")
+    return (str(tok), str(repo)) if tok and repo else None
+
+
+def _gh(method, url, **kw):
+    import requests
+    tok, repo = _gh_cfg()
+    return requests.request(method, "https://api.github.com" + url.replace("{repo}", repo), headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"}, timeout=20, **kw)
+
+
+def _gh_ensure_branch():
+    r = _gh("GET", f"/repos/{{repo}}/git/ref/heads/{GH_BRANCH}")
+    if r.status_code == 200:
+        return True
+    info = _gh("GET", "/repos/{repo}")
+    if info.status_code != 200:
+        return False
+    base = info.json().get("default_branch", "main")
+    sha = _gh("GET", f"/repos/{{repo}}/git/ref/heads/{base}").json().get("object", {}).get("sha")
+    if not sha:
+        return False
+    return _gh("POST", "/repos/{repo}/git/refs", json={"ref": f"refs/heads/{GH_BRANCH}", "sha": sha}).status_code in (200, 201)
+
+
+def _gh_read(name):
+    r = _gh("GET", f"/repos/{{repo}}/contents/{name}?ref={GH_BRANCH}")
+    if r.status_code == 404:
+        return None, None
+    r.raise_for_status()
+    j = r.json()
+    return _b64.b64decode(j["content"]).decode("utf-8"), j["sha"]
+
+
+def _gh_write(name, text, sha, msg):
+    body = {"message": msg, "content": _b64.b64encode(text.encode("utf-8")).decode("ascii"), "branch": GH_BRANCH}
+    if sha:
+        body["sha"] = sha
+    return _gh("PUT", f"/repos/{{repo}}/contents/{name}", json=body)
+
+
+def _local_path(name):
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        base = os.getcwd()
+    return os.path.join(base, name)
+
+
+def _parse_csv(text, cols):
+    import io
+    try:
+        df = pd.read_csv(io.StringIO(text)) if text and text.strip() else pd.DataFrame(columns=cols)
+    except Exception:
+        df = pd.DataFrame(columns=cols)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    return df[cols]
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def store_read(name, cols, mode):
+    cols = list(cols)
+    if mode == "github":
+        try:
+            text, _ = _gh_read(name)
+            return _parse_csv(text, cols)
+        except Exception:
+            pass
+    p = _local_path(name)
+    if os.path.exists(p):
+        try:
+            return _parse_csv(open(p, encoding="utf-8").read(), cols)
+        except Exception:
+            pass
+    return pd.DataFrame(columns=cols)
+
+
+def store_mode():
+    return "github" if _gh_cfg() else "local"
+
+
+def store_append(name, cols, new, key_cols, msg="update"):
+    """Adds rows (newer rows replace older ones with the same key). Returns (ok, where)."""
+    cols = list(cols)
+    if len(new) == 0:
+        return True, store_mode()
+    if _gh_cfg():
+        try:
+            if _gh_ensure_branch():
+                for _ in range(4):
+                    text, sha = _gh_read(name)
+                    cur = _parse_csv(text, cols)
+                    allp = pd.concat([cur, new[cols]], ignore_index=True).drop_duplicates(key_cols, keep="last")
+                    r = _gh_write(name, allp.to_csv(index=False), sha, msg)
+                    if r.status_code in (200, 201):
+                        store_read.clear()
+                        return True, "github"
+                    if r.status_code not in (409, 422):
+                        break
+        except Exception:
+            pass
+    cur = store_read(name, tuple(cols), "local")
+    allp = pd.concat([cur, new[cols]], ignore_index=True).drop_duplicates(key_cols, keep="last")
+    try:
+        allp.to_csv(_local_path(name), index=False)
+        store_read.clear()
+        return True, "local"
+    except Exception:
+        return False, "none"
+
+
+def kickoff_utc(row):
+    """Kickoff time from the schedule (gameday + Eastern gametime)."""
+    try:
+        from zoneinfo import ZoneInfo
+        d = pd.Timestamp(row["gameday"]).date()
+        hh, mm = str(row.get("gametime", "13:00") or "13:00").split(":")[:2]
+        loc = _dt(d.year, d.month, d.day, int(hh), int(mm), tzinfo=ZoneInfo("America/New_York"))
+        return loc.astimezone(_tz.utc)
+    except Exception:
+        return None
+
+
+def is_locked(row, now=None):
+    k = kickoff_utc(row)
+    now = now or _dt.now(_tz.utc)
+    return bool(k is not None and now >= k)
+
+
+def pickem_score(picks, bot, sched, season):
+    """Leaderboard rows and per-player detail from graded games.
+    picks: friends' picks (PICKEM_COLS); bot: DataFrame with season, week, home, away, pick for the Bot."""
+    s = sched[(sched["season"] == season) & sched["home_score"].notna()][["season", "week", "gameday", "home_team", "away_team", "home_score", "away_score"]].rename(columns={"home_team": "home", "away_team": "away"})
+    s = s[s["home_score"] != s["away_score"]].copy()
+    s["winner"] = np.where(s["home_score"] > s["away_score"], s["home"], s["away"])
+    pk = picks[picks["season"] == season].merge(s, on=["season", "week", "home", "away"], how="inner")
+    pk["ok"] = pk["pick"] == pk["winner"]
+    bt = bot.rename(columns={"pick": "bot"})[["season", "week", "home", "away", "bot"]] if len(bot) else pd.DataFrame(columns=["season", "week", "home", "away", "bot"])
+    pk = pk.merge(bt, on=["season", "week", "home", "away"], how="left")
+    pk["bot_ok"] = pk["bot"] == pk["winner"]
+    bs = s.merge(bt, on=["season", "week", "home", "away"], how="inner")
+    bs["ok"] = bs["bot"] == bs["winner"]
+    rows, badges = [], {}
+    for name, g in pk.sort_values("gameday").groupby("player"):
+        ok = g["ok"].tolist()
+        cur = 0
+        for v in reversed(ok):
+            if v:
+                cur += 1
+            else:
+                break
+        best = run = 0
+        for v in ok:
+            run = run + 1 if v else 0
+            best = max(best, run)
+        gb = g[g["bot"].notna()]
+        net = int(((gb["ok"]) & (~gb["bot_ok"])).sum() - ((~gb["ok"]) & (gb["bot_ok"])).sum())
+        bd = []
+        wk = g.groupby("week").agg(n=("ok", "size"), c=("ok", "sum"))
+        if (wk["n"] >= 4).any() and ((wk["c"] == wk["n"]) & (wk["n"] >= 4)).any():
+            bd.append("Perfect week")
+        wb = gb.groupby("week").agg(n=("ok", "size"), c=("ok", "sum"), b=("bot_ok", "sum"))
+        if ((wb["n"] >= 4) & (wb["c"] > wb["b"])).any():
+            bd.append("Bot slayer")
+        if best >= 5:
+            bd.append("Hot streak")
+        if int(((gb["ok"]) & (gb["bot"] != gb["pick"]) & (~gb["bot_ok"])).sum()) >= 3:
+            bd.append("Rebel (right against the Bot 3+ times)")
+        badges[name] = bd
+        rows.append({"Player": name, "Right": int(sum(ok)), "Picks": len(ok), "Win %": 100.0 * sum(ok) / len(ok), "Streak": cur, "Best streak": best, "Vs the Bot": net, "Badges": ", ".join(bd)})
+    lb = pd.DataFrame(rows)
+    if len(lb):
+        lb = lb.sort_values(["Win %", "Picks"], ascending=False).reset_index(drop=True)
+        lb.insert(0, "Rank", range(1, len(lb) + 1))
+    brow = {"Right": int(bs["ok"].sum()), "Picks": int(len(bs))}
+    return lb, brow, pk
+
+
+CONFETTI_HTML = """
+<canvas id="c" style="width:100%;height:150px;display:block"></canvas>
+<script>
+const c=document.getElementById('c'),x=c.getContext('2d');const W=c.width=c.clientWidth*2,H=c.height=300;
+const cols=['#22c55e','#facc15','#38bdf8','#f472b6','#fb923c','#a78bfa'];
+const P=[...Array(140)].map(()=>({x:Math.random()*W,y:-Math.random()*H,r:4+Math.random()*7,vx:(Math.random()-.5)*3,vy:2+Math.random()*4,c:cols[(Math.random()*cols.length)|0],a:Math.random()*6}));
+let t=0;(function f(){x.clearRect(0,0,W,H);P.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.a+=.15;x.save();x.translate(p.x,p.y);x.rotate(p.a);x.fillStyle=p.c;x.fillRect(-p.r/2,-p.r/4,p.r,p.r/2);x.restore();});if(++t<170)requestAnimationFrame(f);else x.clearRect(0,0,W,H);})();
+</script>
+"""
+
+
+# =====================================================================
+# V8: COMMENTARY, PLAYERS OF THE GAME, RIVALRIES, ODDS RACE
+# =====================================================================
+def _ln(n):
+    return str(n).split(" ")[-1] if n else "the offense"
+
+
+def commentary_lines(plays, home, away, only_key=True):
+    out = []
+    for i, p in enumerate(plays):
+        ty = p.get("type")
+        if only_key and not (p.get("key") or p.get("td") or ty in ("fg", "int", "fum", "sack")):
+            continue
+        per, clk = p.get("per", ""), int(p.get("clock", 0) or 0)
+        head = f"**{per} {clk // 60}:{clk % 60:02d}** &middot; {p.get('team', '')} &middot; {p.get('at', '')}"
+        who, tgt, yds = _ln(p.get("who")), _ln(p.get("tgt")), int(p.get("yds", 0) or 0)
+        v = i % 3
+        if ty == "pass":
+            if p.get("td"):
+                line = [f"{who} finds {tgt} in the end zone for {yds}! Touchdown, {p['team']}!", f"{tgt} hauls it in and scores! {yds} yards from {who}.", f"{who} to {tgt}, {yds} yards, and that's six!"][v]
+            elif p.get("first"):
+                line = [f"{who} to {tgt} for {yds}, moving the chains.", f"{tgt} makes the catch for {yds} and it's a first down.", f"Good protection, {who} hits {tgt} for {yds} and a fresh set of downs."][v]
+            else:
+                line = [f"{who} completes it to {tgt} for {yds}.", f"{tgt} makes the grab, {yds} yards.", f"Short of the sticks: {who} to {tgt}, {yds}."][v]
+        elif ty == "run":
+            if p.get("td"):
+                line = [f"{who} punches it in! Touchdown, {p['team']}!", f"{who} finds the end zone from {abs(yds)} out!", f"{who} bursts through for the score!"][v]
+            elif yds >= 15:
+                line = [f"{who} breaks free for {yds} yards!", f"Huge hole and {who} is off for {yds}!", f"{who} rips off a {yds}-yard run."][v]
+            elif p.get("first"):
+                line = f"{who} gets the first down with a {yds}-yard carry."
+            else:
+                line = [f"{who} takes it for {yds}.", f"{who} up the middle, {yds} yards.", f"{who} cuts outside for {yds}."][v]
+        elif ty == "inc":
+            line = [f"{who}'s pass for {tgt} falls incomplete.", f"{who} looks for {tgt} but can't connect.", f"Incomplete. {who} and {tgt} just miss."][v]
+        elif ty == "sack":
+            line = [f"{who} is sacked for a loss of {abs(yds)}!", f"The pocket collapses and {who} goes down.", f"Sack! {who} is buried for -{abs(yds)}."][v]
+        elif ty == "int":
+            line = [f"INTERCEPTED! {who}'s pass is picked off.", f"{who} throws it right to the defense, a turnover!", f"Trouble for {p['team']}: {who} is intercepted."][v]
+        elif ty == "fum":
+            line = f"FUMBLE! The ball is loose and {p.get('text', '').split('recovered by')[-1].strip() or 'the defense'} comes up with it."
+        elif ty in ("fg", "xp"):
+            line = p.get("text", "Kick attempt.")
+        elif ty == "punt":
+            line = f"{p['team']} punts, {yds} yards."
+        else:
+            line = p.get("text", "")
+        if p.get("hs") is not None:
+            line += f" ({away} {p['as']}, {home} {p['hs']})"
+        out.append(head + "  \n" + line)
+    return out
+
+
+def three_stars(box, home, away):
+    sc = {}
+    for t in (home, away):
+        for n, a in box[t]["pass"].items():
+            d = sc.setdefault((n, t), {"s": 0.0, "bits": []})
+            d["s"] += a[2] / 25.0 + 4 * a[3] - 2 * a[4]
+            if a[1]:
+                d["bits"].append(f"{a[0]}/{a[1]}, {a[2]} pass yds" + (f", {a[3]} TD" if a[3] else "") + (f", {a[4]} INT" if a[4] else ""))
+        for n, r in box[t]["rush"].items():
+            d = sc.setdefault((n, t), {"s": 0.0, "bits": []})
+            d["s"] += r[1] / 10.0 + 6 * r[2]
+            d["bits"].append(f"{r[0]} car, {r[1]} rush yds" + (f", {r[2]} TD" if r[2] else ""))
+        for n, e in box[t]["rec"].items():
+            if not n:
+                continue
+            d = sc.setdefault((n, t), {"s": 0.0, "bits": []})
+            d["s"] += e[2] / 10.0 + 6 * e[3] + 0.5 * e[1]
+            d["bits"].append(f"{e[1]} rec, {e[2]} yds" + (f", {e[3]} TD" if e[3] else ""))
+    top = sorted(sc.items(), key=lambda kv: -kv[1]["s"])[:3]
+    return [{"name": n, "team": t, "line": " | ".join(v["bits"]), "score": v["s"]} for (n, t), v in top]
+
+
+def stars_html(stars):
+    meds = ["#facc15", "#cbd5e1", "#f59e0b"]
+    cards = "".join(f'<div class="g7card" style="background:linear-gradient(120deg,{card_color(s["team"])}d9 0%,#0f172a 75%)"><div class="g7top"><span style="color:{meds[i]}">&#9733; STAR {i + 1}</span><span>{s["team"]}</span></div>'
+                    f'<div class="g7row"><div class="g7team" style="font-size:1.25rem">{s["name"]}</div></div><div class="g7sub">{s["line"]}</div></div>' for i, s in enumerate(stars))
+    return '<div class="g7grid">' + cards + '</div>'
+
+
+# ---- rivalries -------------------------------------------------------------------------------
+def series_games(sched, a, b):
+    s = sched.dropna(subset=["home_score", "away_score"])
+    g = s[((s["home_team"] == a) & (s["away_team"] == b)) | ((s["home_team"] == b) & (s["away_team"] == a))].sort_values(["season", "week"]).copy()
+    g["a_pts"] = np.where(g["home_team"] == a, g["home_score"], g["away_score"])
+    g["b_pts"] = np.where(g["home_team"] == a, g["away_score"], g["home_score"])
+    g["a_margin"] = g["a_pts"] - g["b_pts"]
+    return g
+
+
+def series_summary(g):
+    if g.empty:
+        return None
+    aw, bw = int((g["a_margin"] > 0).sum()), int((g["a_margin"] < 0).sum())
+    return {"games": len(g), "a_w": aw, "b_w": bw, "t": len(g) - aw - bw, "avg_margin": float(g["a_margin"].mean()), "avg_total": float((g["a_pts"] + g["b_pts"]).mean()),
+            "close": int((g["a_margin"].abs() <= 7).sum())}
+
+
+def division_rivalry_table(sched):
+    rows = []
+    for conf_div in sorted(set(TEAM_DIV.values())):
+        ts = sorted(t for t, d in TEAM_DIV.items() if d == conf_div)
+        for i in range(len(ts)):
+            for j in range(i + 1, len(ts)):
+                g = series_games(sched, ts[i], ts[j])
+                sm = series_summary(g)
+                if sm:
+                    rows.append({"Division": conf_div, "Matchup": f"{ts[i]} vs {ts[j]}", "Games": sm["games"], "Record": f"{ts[i]} {sm['a_w']}-{sm['b_w']}" + (f"-{sm['t']}" if sm["t"] else ""),
+                                 "Avg margin (first team)": sm["avg_margin"], "Avg total": sm["avg_total"], "Decided by 7 or less %": 100.0 * sm["close"] / sm["games"]})
+    return pd.DataFrame(rows)
+
+
+# ---- odds race ------------------------------------------------------------------------------
+@st.cache_data(show_spinner="Rebuilding the odds after each week...")
+def retro_odds(_sched, season, decay, alpha, sims, last_week, version):
+    """Title odds as they stood after each completed week, using only the games played up to then."""
+    out = []
+    for w in range(1, int(last_week) + 1):
+        m = _sched.copy()
+        mask = (m["season"] == season) & (m["week"] > w)
+        m.loc[mask, ["home_score", "away_score"]] = np.nan
+        ver = int(900000 + season * 100 + w)
+        Rw = fit_ratings(m, decay, alpha, ver)
+        ss = sim_season(Rw, m, season, sims, 11, ver, decay, alpha)
+        st_ = ss["stat"]
+        for i, t in enumerate(ss["teams"]):
+            out.append({"week": w, "team": t, "Make the playoffs": float(st_["playoffs"][i]) * 100, "Win the division": float(st_["division"][i]) * 100,
+                        "Get the #1 seed": float(st_["seed1"][i]) * 100, "Reach the Super Bowl": float(st_["super_bowl"][i]) * 100, "Win the Super Bowl": float(st_["champion"][i]) * 100,
+                        "Projected wins": float(ss["exp_wins"][i])})
+    return pd.DataFrame(out)
+
+
+RACE_HTML = r"""
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,'Segoe UI',Arial,sans-serif;color:#e8eaed;background:transparent}
+#w{background:#0f172a;border-radius:12px;padding:12px 12px 8px}
+#t{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:6px}
+#ttl{font-weight:700;font-size:15px}#wk{font-size:26px;font-weight:800;color:#facc15;font-variant-numeric:tabular-nums;white-space:nowrap}@media(max-width:520px){#ttl{font-size:12px}#wk{font-size:17px}}
+#bars{position:relative}
+.b{position:absolute;left:0;right:0;height:26px;transition:top .55s ease}
+.b i{position:absolute;left:44px;top:2px;height:22px;border-radius:5px;transition:width .55s ease;min-width:2px}
+.b em{position:absolute;left:0;top:4px;width:40px;font-style:normal;font-weight:700;font-size:13px}
+.b s{position:absolute;top:4px;text-decoration:none;font-size:12px;font-weight:700;transition:left .55s ease;white-space:nowrap}
+#c{display:flex;gap:8px;align-items:center;margin-top:8px}
+button{background:#1e293b;color:#fff;border:1px solid #334155;border-radius:8px;padding:6px 12px;font-size:14px;cursor:pointer}
+input[type=range]{flex:1}
+</style>
+<div id="w"><div id="t"><div id="ttl"></div><div id="wk"></div></div><div id="bars"></div>
+<div id="c"><button id="pl">Play</button><input id="sl" type="range" min="0" value="0"><span id="lb" style="font-size:12px;color:#94a3b8;min-width:70px;text-align:right"></span></div></div>
+<script>
+const D=__DATA__;const N=D.top, RH=30;
+const bars=document.getElementById('bars');bars.style.height=(N*RH+4)+'px';
+document.getElementById('ttl').textContent=D.title;
+const els={};D.teams.forEach(t=>{const d=document.createElement('div');d.className='b';d.innerHTML='<em>'+t+'</em><i style="background:'+D.col[t]+'"></i><s></s>';bars.appendChild(d);els[t]=d;});
+const sl=document.getElementById('sl');sl.max=D.frames.length-1;sl.value=sl.max;
+let timer=null;
+function draw(k){const f=D.frames[k];document.getElementById('wk').textContent='After week '+f.w;document.getElementById('lb').textContent='Week '+f.w;
+  const order=D.teams.slice().sort((a,b)=>f.v[b]-f.v[a]);const mx=Math.max(1,D.max);const W=bars.clientWidth-44-70;
+  D.teams.forEach(t=>{const r=order.indexOf(t),e=els[t];e.style.top=(r*RH)+'px';e.style.opacity=r<N?1:0;e.style.pointerEvents='none';const w=Math.max(2,(f.v[t]/mx)*W);e.children[1].style.width=w+'px';
+    const s=e.children[2];s.textContent=f.v[t].toFixed(1)+'%';s.style.left=(44+w+6)+'px';s.style.color='#e8eaed';});}
+sl.oninput=()=>{stop();draw(+sl.value)};
+function stop(){if(timer){clearInterval(timer);timer=null;document.getElementById('pl').textContent='Play'}}
+document.getElementById('pl').onclick=()=>{if(timer){stop();return}if(+sl.value>=+sl.max)sl.value=0;document.getElementById('pl').textContent='Pause';draw(+sl.value);
+  timer=setInterval(()=>{if(+sl.value>=+sl.max){stop();return}sl.value=+sl.value+1;draw(+sl.value)},900)};
+draw(+sl.value);
+</script>
+"""
+
+
+def race_html(df, metric, conf, title):
+    sub = df
+    if conf in ("AFC", "NFC"):
+        sub = df[df["team"].isin(CONFS[conf])]
+    weeks = sorted(sub["week"].unique())
+    teams = sorted(sub["team"].unique())
+    last = sub[sub["week"] == weeks[-1]].sort_values(metric, ascending=False)
+    keep = list(last["team"].head(14))
+    # include anyone who led at some point
+    for w in weeks:
+        top = sub[sub["week"] == w].sort_values(metric, ascending=False).head(6)["team"]
+        keep += [t for t in top if t not in keep]
+    keep = keep[:18]
+    frames = [{"w": int(w), "v": {t: round(float(sub[(sub["week"] == w) & (sub["team"] == t)][metric].iloc[0]), 2) for t in keep}} for w in weeks]
+    mx = max(max(f["v"].values()) for f in frames)
+    data = {"title": title, "top": min(10, len(keep)), "teams": keep, "col": {t: card_color(t) for t in keep}, "frames": frames, "max": mx}
+    return RACE_HTML.replace("__DATA__", json.dumps(data))
+
+
+def jersey_numbers(ros, teams):
+    """{player name: jersey number} for the two teams, from the latest weekly roster."""
+    try:
+        d = ros[ros["team"].isin(teams)].dropna(subset=["jersey_number"])
+        d = d[d["week"] == d.groupby("team")["week"].transform("max")]
+        return {str(r["full_name"]): int(float(r["jersey_number"])) for r in d.to_dict("records") if str(r["jersey_number"]).replace(".0", "").isdigit()}
+    except Exception:
+        return {}
+
+
+HIST_FILE = "nfl_odds_history.csv"
+HIST_COLS = ["date", "week", "team", "proj_wins", "playoffs", "division", "seed1", "super_bowl"]
+
+
+def load_odds_history():
+    p = _local_path(HIST_FILE)
+    if not os.path.exists(p):
+        return None
+    try:
+        d = pd.read_csv(p)
+        return d if len(d) else None
+    except Exception:
+        return None
 
 
 # =====================================================================
@@ -3436,14 +4017,16 @@ with st.container(key="matchbar"):
     mb3, mb4 = st.columns([1, 1])
     neutral = mb3.checkbox("Neutral site")
     run = mb4.button("▶ Simulate game", type="primary", key="run_btn")
-t_game, t_field, t_players, t_bets, t_week, t_season, t_teams, t_setup = st.tabs(["Game", "Field", "Players", "Bets", "Week", "Season", "Teams", "Setup"])
+t_game, t_field, t_players, t_bets, t_week, t_pickem, t_season, t_teams, t_setup = st.tabs(["Game", "Field", "Players", "Bets", "Week", "Pick'em", "Season", "Teams", "Setup"])
+with t_season:
+    tab_season, tab_race, tab_riv = st.tabs(["Odds", "Race", "Rivalries"])
 with t_players:
     tab_players, tab_box, tab_pbp = st.tabs(["Projections", "Box score", "Plays"])
 with t_bets:
     tab_props, tab_slip, tab_sgp, tab_mybets, tab_bet, tab_track = st.tabs(["Props board", "Place a bet", "Parlay", "My bets", "Value finder", "Model picks"])
 with t_teams:
     tab_bt, tab_roster, tab_inj, tab_style, tab_ratings = st.tabs(["Backtest", "Rosters", "Injuries", "Team style", "Ratings"])
-tab_game, tab_anim, tab_slate, tab_season, tab_drives = t_game, t_field, t_week, t_season, tab_pbp
+tab_game, tab_anim, tab_slate, tab_drives = t_game, t_field, t_week, tab_pbp
 
 with t_setup:
     st.subheader("Model settings")
@@ -3501,6 +4084,16 @@ with t_setup:
     elif use_depth:
         pool, qbs = apply_depth(pool, qbs, depth)
         st.caption("Default lineups follow the latest nflverse depth chart (rechecked hourly). You can still change any lineup below.")
+
+    use_situ = st.checkbox("Rest and bye weeks", value=True, help="Moves the margin a little when one team is coming off a bye and the other is not. The size is measured from past games (see below).")
+    SITU = situ_fit(sched, R, version, decay, alpha)
+    with st.expander("What past games say about rest and travel"):
+        if SITU["rows"]:
+            st.dataframe(pd.DataFrame(SITU["rows"]), hide_index=True, column_config={"Points for the home side": st.column_config.NumberColumn(format="%+.2f"), "Std. error": st.column_config.NumberColumn(format="%.2f"), "Typical season": st.column_config.NumberColumn(format="%+.2f")})
+            st.caption(f"Each row is how many points that factor moved the home team's margin beyond what the ratings predicted, across {SITU['n']:,} games. An effect smaller than about twice its standard error is just noise. "
+                       f"Only the bye-week effect is applied, using the average of each completed season's own estimate (the Typical season column) and damped by 20%: currently {SITU['applied']:.1f} points when exactly one team is off a bye. Short weeks, miles and time zones are shown on the game cards but do not change the odds, because the data doesn't show a reliable effect.")
+        else:
+            st.caption("Not enough games with rest data yet.")
 
     st.subheader("Injuries")
     weeks = sorted(int(w) for w in inj_df["week"].dropna().unique()) if len(inj_df) else []
@@ -3587,6 +4180,9 @@ with t_setup:
         oa = st.slider(f"{away} offense", -10.0, 10.0, 0.0, 0.5, key="adj_off_away")
         da = st.slider(f"{away} defense", -10.0, 10.0, 0.0, 0.5, key="adj_def_away")
     adj = {home: qb_adj[home] + oh + da, away: qb_adj[away] + oa + dh}
+    _sa, _sn = situ_adj(dict(SITU, apply=use_situ), find_game(sched, latest, home, away), home, away, neutral)
+    for _t_, _v_ in _sa.items():
+        adj[_t_] = adj.get(_t_, 0.0) + _v_
 
     st.subheader("Model options")
     use_style = st.checkbox("Team style (from play-by-play)", value=S_all is not None, disabled=S_all is None, help="Each team's pace, turnover rate, field-goal vs touchdown mix, and passing share, learned from the last two seasons of drives.")
@@ -3625,11 +4221,13 @@ if run:
                     notes.append(f"{t}: other adjustments, offense {o:+.1f} / defense {d:+.1f} pts")
             if use_ros and not ros_df.empty and ov_eff:
                 notes.append("Manual roster moves in effect: " + ", ".join(f"{v['name']} to {v['team']}" for v in ov_eff.values()))
+            if _sn:
+                notes.append("Rest and travel: " + "; ".join(_sn) + (f" (moves the margin {_sa.get(home, 0.0) * 2:+.1f} for {home})" if _sa else " (shown for context, no change to the odds)"))
             notes.append("Team style: " + ("on" if S_use else "off (league-average style)") + " | Game flow: " + ("on" if use_flow else "off") + " | Rosters: " + (f"current through week {ros_week}" if (use_ros and not ros_df.empty) else "each player's last team"))
             prep = prepare(R, S_use, prof_used, home, away, neutral, adj, use_flow)
             typ, avg_df = typical_game(prep, drive_sims, use_flow)
             game = simulate_game(R, S_use, home, away, game_sims, neutral, adj)
-            st.session_state["res"] = {"home": home, "away": away, "neutral": neutral, "notes": notes, "prep": prep, "flow": use_flow, "S": S_use, "inj_week": inj_week, "use_inj": use_inj,
+            st.session_state["res"] = {"adj": dict(adj), "qbcur": {home: qb_h, away: qb_a}, "rest_note": "; ".join(_sn), "home": home, "away": away, "neutral": neutral, "notes": notes, "prep": prep, "flow": use_flow, "S": S_use, "inj_week": inj_week, "use_inj": use_inj,
                                        "game": game, "line": market_from_row(find_game(sched, latest, home, away)), "players": sim_players(R, prof_used, home, away, game), "typical": typ, "avg": avg_df, "drive_sims": drive_sims, "one": run_game(prep, use_flow), "anim": None}
 
 res = st.session_state.get("res")
@@ -3658,8 +4256,34 @@ with tab_slate:
             else:
                 if (sdf["Injury report"] == "not posted yet").all():
                     st.caption("The injury report for this week isn't posted yet, so default lineups only reflect the rosters. Re-run after the report comes out (usually Wednesday or Thursday).")
+                _wp = weekly_picks(sdf)
+                if _wp:
+                    st.markdown('<div class="g7grid">' + "".join(pick_card_html(k, _wp[k]) for k in ("lock", "upset", "coin") if k in _wp) + '</div>', unsafe_allow_html=True)
+                    if "upset" not in _wp:
+                        st.caption("No upset alert: the model sides with the market's favorite in every game that has a line.")
+                    _gm = grade_preds(load_preds(), sched)
+                    _gd = _gm[_gm["done"] & (_gm["act_m"] != 0)]
+                    if len(_gd):
+                        _w_ = int(((_gd["p_home"] > 0.5) == (_gd["act_m"] > 0)).sum())
+                        st.caption(f"Model record on picks saved before kickoff: {_w_}-{len(_gd) - _w_} ({100.0 * _w_ / len(_gd):.0f}%).")
+                    else:
+                        st.caption("The model's record will appear here once saved picks have been graded. The daily robot saves them automatically.")
+                with st.expander("Check a price from your sportsbook"):
+                    _pg = st.selectbox("Game", [r_["Game"] for r_ in sdf.to_dict("records")], key="pc_game")
+                    _pr = [r_ for r_ in sdf.to_dict("records") if r_["Game"] == _pg][0]
+                    _ps = st.radio("Side", [_pr["_home"], _pr["_away"]], horizontal=True, key="pc_side")
+                    _po = st.number_input("American odds you were offered", value=-110.0, step=5.0, key="pc_odds")
+                    _pw = _pr["_p_home"] if _ps == _pr["_home"] else 1 - _pr["_p_home"]
+                    _pm = bet_math(_pw, 0.0, 1 - _pw, _po, 10.0, float(st.session_state.get("bet_bank0", 1000.0)), float(st.session_state.get("bet_frac", 0.25)))
+                    _pk = st.container(key="kpis_pc")
+                    _pc = _pk.columns(4)
+                    _pc[0].metric("Model win chance", f"{_pw * 100:.1f}%")
+                    _pc[1].metric("Break-even chance", f"{_pm['be'] * 100:.1f}%", help="The win chance this price needs just to break even")
+                    _pc[2].metric("Profit per $100 (model)", f"{_pm['ev'] * 100:+.1f}", help="Expected profit on a $100 bet if the model's chance were exactly right")
+                    _pc[3].metric("Kelly stake", f"${_pm['stake_k']:,.0f}" if _pm["kelly"] > 0 else "$0", help="Fractional-Kelly size for your bankroll; zero means the model sees no edge")
+                    st.caption("Win chance is the simulator's moneyline chance for that side. A positive profit number means the model thinks the price is too generous; the model has trailed the market in the Backtest, so treat it as a prompt to look closer.")
                 _cards = "".join(game_card_html(r["_away"], r["_home"], r["_p_home"], (r["_sim_t"] - r["_sim_m"]) / 2, (r["_sim_t"] + r["_sim_m"]) / 2, r.get("_spread"), r.get("_total"), r.get("_mkt_p"),
-                                                 r.get("_qb_a"), r.get("_qb_h"), str(r.get("Date", ""))) for r in sdf.to_dict("records"))
+                                                 r.get("_qb_a"), r.get("_qb_h"), str(r.get("Date", "")), r.get("Rest & travel", "")) for r in sdf.to_dict("records"))
                 st.markdown('<div class="g7grid">' + _cards + '</div>', unsafe_allow_html=True)
                 cfg = {
                     "Home win %": st.column_config.NumberColumn(format="%.1f"),
@@ -3674,6 +4298,7 @@ with tab_slate:
                     "Win % vs market": st.column_config.NumberColumn(format="%+.1f"),
                 }
                 cols = [c for c in ["Date", "Game", "Sim favorite", "Home win %", "Sim score (away-home)", "Sim margin (home)", "Line (home margin)", "Sim minus line", "Home covers %", "Sim total", "Total line", "Over %", "Market home win %", "Win % vs market", "QBs used"] if c in sdf.columns]
+                cols = cols + (["Rest & travel"] if "Rest & travel" in sdf.columns else [])
                 st.dataframe(sdf[cols], hide_index=True, column_config=cfg, height=min(36 * (len(sdf) + 1) + 3, 700))
                 b1, b2 = st.columns([1, 1])
                 b1.download_button("Download as CSV", sdf[[c for c in sdf.columns if not c.startswith("_")]].to_csv(index=False).encode("utf-8"), file_name=f"nfl_week_{sl['week']}_sim.csv", mime="text/csv")
@@ -3744,6 +4369,7 @@ with tab_season:
             rows.append({"Conf": c, "Division": TEAM_DIV.get(t, ""), "Team": t, "Record": rec, "Proj wins": float(ss["exp_wins"][i]), "Playoffs %": stt["playoffs"][i] * 100, "Win division %": stt["division"][i] * 100,
                          "#1 seed %": stt["seed1"][i] * 100, "Reach conf final %": stt["conf_final"][i] * 100, "Reach Super Bowl %": stt["super_bowl"][i] * 100, "Win Super Bowl %": stt["champion"][i] * 100})
         df_s = pd.DataFrame(rows)
+        st.session_state["ss_df"] = df_s
         cfgs = {c: st.column_config.NumberColumn(format="%.1f") for c in df_s.columns if "%" in c or c == "Proj wins"}
         for conf in ("AFC", "NFC"):
             st.subheader(conf)
@@ -3793,6 +4419,180 @@ with tab_season:
             st.caption("Single-elimination: the #1 seed gets a first-round bye, the higher seed hosts, the divisional round reseeds, and the Super Bowl is at a neutral site. 20,000 simulated playoffs.")
     else:
         st.info("Press Run season simulation.")
+
+with t_pickem:
+    st.subheader("Beat the Bot")
+    st.caption("Pick the winner of every game before kickoff and see if you can beat the simulator. The Bot's pick is the model's favorite, saved by the daily robot before the games. "
+               "The Bot's pick stays hidden until you've saved yours (or the game has started), so nobody can copy it.")
+    _mode = store_mode()
+    _need_code = _secret("PICKEM_CODE")
+    _preds = load_preds()
+    _preds = _preds[~_preds["late"].astype(bool)] if len(_preds) else _preds
+    if len(_preds):
+        _bot = _preds[["season", "week", "home", "away", "p_home"]].copy()
+        _bot["pick"] = np.where(_bot["p_home"] >= 0.5, _bot["home"], _bot["away"])
+        _bot = _bot[["season", "week", "home", "away", "pick"]].drop_duplicates(["season", "week", "home", "away"], keep="last")
+    else:
+        _bot = pd.DataFrame(columns=["season", "week", "home", "away", "pick"])
+    _all = store_read(PICKEM_FILE, tuple(PICKEM_COLS), _mode)
+    pe_weeks = sorted(int(w) for w in sched[sched["season"] == latest]["week"].unique())
+    _open_w = [w for w in pe_weeks if sched[(sched["season"] == latest) & (sched["week"] == w) & sched["home_score"].isna()].shape[0] > 0]
+    c1, c2, c3 = st.columns([2, 1, 1])
+    pe_name = c1.text_input("Your name", key="pe_name", max_chars=20, placeholder="e.g. Alan").strip()
+    pe_week = c2.selectbox("Week", _open_w or pe_weeks, key="pe_week")
+    pe_code = c3.text_input("Group code", key="pe_code", type="password") if _need_code else ""
+    _g = sched[(sched["season"] == latest) & (sched["week"] == pe_week)].sort_values(["gameday", "gametime", "home_team"])
+    _mine = _all[(_all["player"].astype(str) == pe_name) & (_all["season"] == latest) & (_all["week"] == pe_week)] if pe_name else _all.iloc[0:0]
+    _mine_map = {(r["home"], r["away"]): r["pick"] for r in _mine.to_dict("records")}
+    _botmap = {(r["home"], r["away"]): r["pick"] for r in _bot[(_bot["season"] == latest) & (_bot["week"] == pe_week)].to_dict("records")}
+    if not pe_name:
+        st.info("Type your name to make picks. Use the same name each week so your record adds up.")
+    choices = {}
+    st.markdown("**Your picks**")
+    for r in _g.to_dict("records"):
+        hh, aa = r["home_team"], r["away_team"]
+        final = pd.notna(r["home_score"])
+        locked = final or is_locked(r)
+        saved = _mine_map.get((hh, aa))
+        lab = f"{aa} @ {hh}  ({str(r['gameday'])[5:]} {r.get('gametime') or ''} ET)" + ("  locked" if locked else "")
+        idx = [aa, hh].index(saved) if saved in (aa, hh) else None
+        sel = st.radio(lab, [aa, hh], index=idx, horizontal=True, key=f"pe_{pe_name}_{pe_week}_{hh}_{aa}", disabled=(locked or not pe_name))
+        if not locked and sel:
+            choices[(hh, aa)] = sel
+        bp = _botmap.get((hh, aa))
+        if bp and (saved or locked):
+            tail = ""
+            if final:
+                win = hh if r["home_score"] > r["away_score"] else (aa if r["away_score"] > r["home_score"] else None)
+                tail = f"  | final {aa} {int(r['away_score'])}-{int(r['home_score'])}: Bot {'right' if bp == win else 'wrong'}" + (f", you {'right' if saved == win else 'wrong'}" if saved else "")
+            st.caption(f"Bot picked {bp}{tail}")
+        elif not bp and (saved or locked):
+            st.caption("The Bot has no saved pick for this game.")
+    if st.button("Save my picks", type="primary", key="pe_save", disabled=not pe_name):
+        if _need_code and pe_code != str(_need_code):
+            st.error("That group code isn't right.")
+        elif not choices:
+            st.warning("Pick at least one game that hasn't started.")
+        else:
+            now = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M")
+            new = pd.DataFrame([{"saved_at": now, "season": int(latest), "week": int(pe_week), "player": pe_name, "home": k[0], "away": k[1], "pick": v} for k, v in choices.items()])
+            ok, where = store_append(PICKEM_FILE, PICKEM_COLS, new, ["season", "week", "player", "home", "away"], msg=f"pick'em: {pe_name} week {pe_week}")
+            if ok:
+                st.success(f"Saved {len(new)} picks for {pe_name}." + (" Stored safely on GitHub." if where == "github" else " Stored in this app's own file, which can reset when the app restarts (see the setup notes to keep picks permanently)."))
+                show_html(CONFETTI_HTML, 160)
+            else:
+                st.error("Couldn't save the picks.")
+    st.markdown("---")
+    st.subheader("Leaderboard")
+    _all = store_read(PICKEM_FILE, tuple(PICKEM_COLS), _mode)
+    if _all.empty:
+        st.info("No picks yet. Be the first!")
+    else:
+        lb, brow, pk_g = pickem_score(_all, _bot, sched, latest)
+        if brow["Picks"]:
+            st.caption(f"The Bot is {brow['Right']}-{brow['Picks'] - brow['Right']} ({100.0 * brow['Right'] / brow['Picks']:.0f}%) on the graded games it has picks for.")
+        if lb.empty:
+            st.info("Nothing to grade yet. Scores appear once the games you picked have finished.")
+        else:
+            st.dataframe(lb, hide_index=True, column_config={"Win %": st.column_config.NumberColumn(format="%.1f")})
+            if pe_name and pe_name in set(lb["Player"]) and "Bot slayer" in lb.loc[lb["Player"] == pe_name, "Badges"].iloc[0] and not st.session_state.get("pe_celebrated"):
+                st.session_state["pe_celebrated"] = True
+                st.success(f"{pe_name}, you've beaten the Bot in a week!")
+                show_html(CONFETTI_HTML, 160)
+        st.markdown("**This week's picks (shown once each game has started)**")
+        wk_rows = []
+        for r in _g.to_dict("records"):
+            hh, aa = r["home_team"], r["away_team"]
+            if not (pd.notna(r["home_score"]) or is_locked(r)):
+                continue
+            win = None
+            if pd.notna(r["home_score"]) and r["home_score"] != r["away_score"]:
+                win = hh if r["home_score"] > r["away_score"] else aa
+            row_ = {"Game": f"{aa} @ {hh}"}
+            bp = _botmap.get((hh, aa))
+            row_["Bot"] = (bp + (" ok" if bp == win else "") if bp and win else bp) if bp else "-"
+            for pl_name, gg in _all[(_all["season"] == latest) & (_all["week"] == pe_week) & (_all["home"] == hh) & (_all["away"] == aa)].groupby("player"):
+                p_ = gg.iloc[-1]["pick"]
+                row_[str(pl_name)] = p_ + (" ok" if (win and p_ == win) else "")
+            wk_rows.append(row_)
+        if wk_rows:
+            st.dataframe(pd.DataFrame(wk_rows).fillna("-"), hide_index=True)
+            st.caption('"ok" marks a correct pick once the game is final.')
+        else:
+            st.caption("No games from this week have started yet.")
+    if _mode == "local":
+        st.caption("Picks are being saved to a file inside the app. On Streamlit Cloud that file can reset when the app restarts. Add GH_TOKEN and GH_REPO in the app's Secrets to keep them permanently on a separate GitHub branch (setup notes included).")
+
+with tab_race:
+    st.caption("Watch the title race unfold. For every completed week, the ratings are rebuilt using only the games played by then, the rest of the season is simulated, and the odds are plotted. Nothing here looks ahead.")
+    _done = sched[(sched["season"] == latest) & sched["home_score"].notna()]
+    _lw = int(_done["week"].max()) if len(_done) else 0
+    if _lw < 2:
+        st.info("The race starts once two weeks have been played.")
+    else:
+        r1, r2 = st.columns(2)
+        rc_metric = r1.selectbox("Race for", ["Win the Super Bowl", "Make the playoffs", "Win the division", "Get the #1 seed", "Reach the Super Bowl", "Projected wins"], key="race_metric")
+        rc_conf = r2.selectbox("Teams", ["All 32", "AFC", "NFC"], key="race_conf")
+        if st.button("Build the race", type="primary", key="race_go") or st.session_state.get("race_on"):
+            st.session_state["race_on"] = True
+            _rdf = retro_odds(sched, latest, decay, alpha, 3000, _lw, version)
+            show_html(race_html(_rdf, rc_metric, rc_conf, f"{rc_metric}: {rc_conf}"), 440)
+            st.caption("Press Play to watch it move week by week, or drag the slider. Each bar is a team's chance in the simulated seasons after that week.")
+            with st.expander("Table: odds after the latest week"):
+                _lt = _rdf[_rdf["week"] == _lw].drop(columns=["week"]).set_index("team").sort_values("Win the Super Bowl", ascending=False)
+                st.dataframe(_lt.style.format("{:.1f}") if hasattr(_lt, "style") else _lt)
+        else:
+            st.info("Press Build the race. The first time takes a few seconds per week of football; after that it's saved.")
+    _hist = load_odds_history()
+    if _hist is not None and _hist["date"].nunique() >= 2:
+        st.subheader("Daily snapshots")
+        st.caption("Taken each morning by the daily robot, so they include moves from injuries, lineups and rest as well as results.")
+        _pick = st.multiselect("Teams", sorted(_hist["team"].unique()), default=list(_hist.sort_values("super_bowl", ascending=False)["team"].drop_duplicates().head(5)), key="race_hist_teams")
+        if _pick:
+            _pv = _hist[_hist["team"].isin(_pick)].pivot_table(index="date", columns="team", values="super_bowl")
+            st.line_chart(_pv)
+            st.caption("Chance to win the Super Bowl (%).")
+
+with tab_riv:
+    st.caption(f"Results since 2017 (the seasons in this app's data), plus what the simulator says about the next meeting.")
+    _tl = sorted(R["off"].keys())
+    ra, rb = st.columns(2)
+    _ra = ra.selectbox("Team", _tl, index=_tl.index(home) if home in _tl else 0, key="riv_a")
+    _rb = rb.selectbox("Rival", [t for t in _tl if t != _ra], index=0 if away == _ra or away not in _tl else [t for t in _tl if t != _ra].index(away), key="riv_b")
+    _sg = series_games(sched, _ra, _rb)
+    _ss = series_summary(_sg)
+    if _ss is None:
+        st.info("No completed games between these teams in the data.")
+    else:
+        kc = st.container(key="kpis_riv")
+        c = kc.columns(4)
+        c[0].metric("Series", f"{_ra} {_ss['a_w']}-{_ss['b_w']}" + (f"-{_ss['t']}" if _ss["t"] else ""))
+        c[1].metric(f"Avg margin ({_ra})", f"{_ss['avg_margin']:+.1f}")
+        c[2].metric("Avg total points", f"{_ss['avg_total']:.1f}")
+        c[3].metric("Decided by 7 or less", f"{_ss['close']} of {_ss['games']}")
+        _chart = _sg.assign(label=_sg["season"].astype(int).astype(str) + " wk" + _sg["week"].astype(int).astype(str)).set_index("label")["a_margin"]
+        st.bar_chart(_chart)
+        st.caption(f"Margin in each game, {_ra} perspective (above zero means {_ra} won).")
+        _tbl = _sg.assign(Game=_sg["away_team"] + " @ " + _sg["home_team"], Score=_sg["away_score"].astype(int).astype(str) + "-" + _sg["home_score"].astype(int).astype(str))[["season", "week", "Game", "Score"]].rename(columns={"season": "Season", "week": "Week"})
+        st.dataframe(_tbl.iloc[::-1], hide_index=True)
+    _nx = sched[(sched["season"] == latest) & sched["home_score"].isna() & (((sched["home_team"] == _ra) & (sched["away_team"] == _rb)) | ((sched["home_team"] == _rb) & (sched["away_team"] == _ra)))].sort_values("week")
+    st.markdown("**What the simulator says**")
+    _S_r = S_all if (use_style and S_all) else None
+    _sims = []
+    for _h2, _a2 in ((_ra, _rb), (_rb, _ra)):
+        _g2 = simulate_game(R, _S_r, _h2, _a2, 10000, False)
+        _sims.append(f"At {_h2}: {_h2} {float((_g2['hs'] > _g2['as']).mean()) * 100:.0f}% / {_a2} {float((_g2['as'] > _g2['hs']).mean()) * 100:.0f}% (avg {_h2} {_g2['hs'].mean():.0f} - {_a2} {_g2['as'].mean():.0f})")
+    st.write("  \n".join(_sims))
+    if len(_nx):
+        _r0 = _nx.iloc[0]
+        st.caption(f"Next meeting: week {int(_r0['week'])}, {_r0['away_team']} @ {_r0['home_team']} ({str(_r0['gameday'])[5:]}).")
+    else:
+        st.caption("These teams don't meet again this regular season.")
+    with st.expander("Every division rivalry"):
+        _dv = division_rivalry_table(sched)
+        st.dataframe(_dv, hide_index=True, column_config={"Avg margin (first team)": st.column_config.NumberColumn(format="%+.1f"), "Avg total": st.column_config.NumberColumn(format="%.1f"),
+                                                        "Decided by 7 or less %": st.column_config.NumberColumn(format="%.0f")})
+
 
 with tab_track:
     st.caption("Save a week's slate picks before kickoff, and the tracker grades them against the real results as games finish: how often the simulator picked the winner, how good its percentages were, and its record against the spread and totals.")
@@ -4054,7 +4854,7 @@ else:
         _mk = res.get("line") or {}
         _ph = float((res["game"]["hs"] > res["game"]["as"]).mean())
         st.markdown(game_card_html(a, h, _ph, float(res["game"]["as"].mean()), float(res["game"]["hs"].mean()), _mk.get("spread"), _mk.get("total"), _mk.get("p_home"),
-                                   date="Neutral site" if res.get("neutral") else "Home field: " + h).replace('class="g7card"', 'class="g7card g7hero"'), unsafe_allow_html=True)
+                                   date="Neutral site" if res.get("neutral") else "Home field: " + h, note=res.get("rest_note", "")).replace('class="g7card"', 'class="g7card g7hero"'), unsafe_allow_html=True)
         with st.container(key="kpis_game"):
             c1, c2, c3, c4 = st.columns(4)
             c1.metric(f"{a} win", f"{(as_ > hs).mean() * 100:.1f}%")
@@ -4070,6 +4870,39 @@ else:
         st.bar_chart(dist / len(mc) * 100)
         st.caption("Scores are built from touchdowns, extra points, field goals, and the occasional defensive score, so common football numbers (3, 7, 10, 14) show up more often than in a smooth bell curve. Watch a full game play out on the Field tab.")
         show_line_box(res)
+        st.subheader("What-if lab")
+        st.caption("Change one thing and see how the odds move. This quick version re-simulates the game from the team ratings (and team style, if it's on) but skips the play-by-play game flow, so it's best for comparing scenarios against each other.")
+        _base_adj = dict(res.get("adj") or {h: 0.0, a: 0.0})
+        _qd = {}
+        wq = st.columns(2)
+        for _col, _t in zip(wq, (h, a)):
+            _cur = (res.get("qbcur") or {}).get(_t)
+            _opts = ["Same QB"] + [q["name"] for q in qbs.get(_t, []) if not _cur or q["name"] != _cur["name"]]
+            _ch = _col.selectbox(f"{_t} quarterback", _opts, key=f"wif_qb_{_t}")
+            _qd[_t] = 0.0
+            if _ch != "Same QB" and _cur is not None:
+                _q2 = next(q for q in qbs[_t] if q["name"] == _ch)
+                _qd[_t] = (_q2["rate"] - _cur["rate"]) * DROPBACKS * QB_WEIGHT
+        wo = st.columns(4)
+        _oh = wo[0].slider(f"{h} offense", -7.0, 7.0, 0.0, 0.5, key="wif_oh")
+        _dh = wo[1].slider(f"{h} defense", -7.0, 7.0, 0.0, 0.5, key="wif_dh", help="+ means the defense allows more points")
+        _oa = wo[2].slider(f"{a} offense", -7.0, 7.0, 0.0, 0.5, key="wif_oa")
+        _da = wo[3].slider(f"{a} defense", -7.0, 7.0, 0.0, 0.5, key="wif_da", help="+ means the defense allows more points")
+        _neu = st.checkbox("Play it at a neutral site", value=bool(res["neutral"]), key="wif_neu")
+        if st.button("Run what-if", key="wif_go"):
+            _new = {h: _base_adj.get(h, 0.0) + _qd[h] + _oh + _da, a: _base_adj.get(a, 0.0) + _qd[a] + _oa + _dh}
+            _b0 = simulate_game(R, res["S"], h, a, 20000, res["neutral"], _base_adj)
+            _b1 = simulate_game(R, res["S"], h, a, 20000, _neu, _new)
+            st.session_state["wif"] = {"h": h, "a": a, "b0": (_b0["hs"], _b0["as"]), "b1": (_b1["hs"], _b1["as"])}
+        _w = st.session_state.get("wif")
+        if _w and _w["h"] == h and _w["a"] == a:
+            def _sm(hs_, as_):
+                return {f"{h} win %": float((hs_ > as_).mean()) * 100, f"{a} win %": float((as_ > hs_).mean()) * 100, f"Avg margin ({h})": float((hs_ - as_).mean()), "Avg total": float((hs_ + as_).mean())}
+            _s0, _s1 = _sm(*_w["b0"]), _sm(*_w["b1"])
+            _tb = pd.DataFrame({"Metric": list(_s0), "Now": [_s0[k] for k in _s0], "What-if": [_s1[k] for k in _s0], "Change": [_s1[k] - _s0[k] for k in _s0]})
+            st.dataframe(_tb, hide_index=True, column_config={c_: st.column_config.NumberColumn(format="%.1f") for c_ in ("Now", "What-if")} | {"Change": st.column_config.NumberColumn(format="%+.1f")})
+            _d = _s1[f"{h} win %"] - _s0[f"{h} win %"]
+            st.caption(f"The change moves {h}'s win chance by {_d:+.1f} points.")
     with tab_anim:
         st.radio("Game to watch", ["Most typical game", "A new random game"], horizontal=True, key="gsel", help="The typical game is the simulated game closest to the averages. A random game is one draw from the same simulator.")
         if st.session_state.get("gsel", "").startswith("A new"):
@@ -4078,7 +4911,7 @@ else:
                 res.setdefault("fx", {}).pop("random", None)
         g_view, plays_view, vkey = game_view(res)
         st.caption(f"{a} @ {h}" + (" (OT)" if g_view["ot"] else "") + f" final: {a} {g_view['score'][a]}, {h} {g_view['score'][h]}. Tap a player for his stats.")
-        show_html(build_field_html(g_view, res["prep"], float(res["game"]["mu"][0] - res["game"]["mu"][1]), plays_view), 1500)
+        show_html(build_field_html(g_view, res["prep"], float(res["game"]["mu"][0] - res["game"]["mu"][1]), plays_view, jersey_numbers(ros_df, (h, a))), 1500)
     with tab_players:
         st.caption("Format: average (10th-90th percentile range). Based on each selected player's last 6 games played, scaled to the simulated score.")
         for t in (h, a):
@@ -4089,6 +4922,8 @@ else:
         st.caption(f"Box score of the {'most typical' if vkey == 'typical' else 'random'} simulated game (switch games on the Field tab). Every number is added up from the individual plays you can watch there.")
         bx = box_score(plays_view, h, a)
         fr = box_frames(bx, plays_view, h, a)
+        st.markdown('**Players of the game**')
+        st.markdown(stars_html(three_stars(bx, h, a)), unsafe_allow_html=True)
         k1, k2 = st.columns(2)
         k1.metric(a, g_view["score"][a])
         k2.metric(h, g_view["score"][h])
@@ -4107,6 +4942,12 @@ else:
             st.dataframe(res["avg"], hide_index=True)
         st.subheader(f"{a} @ {h}" + ("  (went to OT)" if g_view["ot"] else ""))
         st.dataframe(summary_df(g_view), hide_index=True)
+        if st.checkbox("Broadcast commentary", key="pbp_comm", help="A play-by-play call of the key moments in this simulated game."):
+            _all_c = st.checkbox("Call every play, not just the big ones", key="pbp_comm_all")
+            _cl = commentary_lines(plays_view, h, a, only_key=not _all_c)
+            st.markdown("\n\n".join(_cl[:80]) if _cl else "Nothing to call yet.", unsafe_allow_html=True)
+            if len(_cl) > 80:
+                st.caption(f"Showing the first 80 of {len(_cl)} calls.")
         opts = ["All drives"] + [f"{i + 1}. {d['team']} - {d['text']}" for i, d in enumerate(g_view["drives"])]
         pick_d = st.selectbox("Show plays from", opts, key="pbp_drive")
         only_key = st.checkbox("Key plays only", key="pbp_key")
