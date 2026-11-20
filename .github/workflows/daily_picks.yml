@@ -28,7 +28,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Save picks, take the odds snapshot, report the record
-        run: python save_predictions.py nfl_app.py
+        run: python save_predictions.py nfl_dashboard_v2.py
 
       - name: Commit the data files if they changed
         run: |
