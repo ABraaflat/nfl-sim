@@ -7,6 +7,11 @@ try:
 except Exception:
     components = None
 import nflreadpy as nfl
+try:                                   # nflreadpy keeps downloads for 24 hours by default, which hides new final scores; 2 minutes is plenty
+    from nflreadpy.config import update_config as _nfl_cfg
+    _nfl_cfg(cache_duration=120)
+except Exception:
+    pass
 from sklearn.linear_model import Ridge
 
 st.set_page_config(page_title="NFL Simulator", page_icon="🏈", layout="wide", initial_sidebar_state="collapsed")
@@ -58,7 +63,7 @@ def yl(s):
 # =====================================================================
 # DATA LOADING
 # =====================================================================
-@st.cache_data(ttl=6 * 3600, show_spinner="Loading 10 seasons of NFL data (first time takes a minute)...")
+@st.cache_data(ttl=2 * 3600, show_spinner="Loading 10 seasons of NFL data (first time takes a minute)...")
 def load_data():
     seasons = list(range(CURRENT_SEASON - 9, CURRENT_SEASON + 1))
     try:
@@ -89,6 +94,18 @@ def load_data():
     keep = ["player_id", "pname", "position", "tm", "season", "week", "carries", "targets", "attempts", "dropbacks", "pass_epa"] + STATS
     pl = pl[[c for c in dict.fromkeys(keep) if c in pl.columns]].copy()
     return sched, pl, seasons
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def load_sched_fresh(seasons_t):
+    """The schedule on its own, re-checked every few minutes so a final score shows up soon after the game ends."""
+    try:
+        s = to_pandas(nfl.load_schedules(list(seasons_t)))
+        s["home_team"] = s["home_team"].replace(FIX)
+        s["away_team"] = s["away_team"].replace(FIX)
+        return s, pd.Timestamp.now(tz="UTC")
+    except Exception:
+        return None, pd.Timestamp.now(tz="UTC")
 
 
 @st.cache_data(ttl=1200, show_spinner="Checking the latest injury reports...")
@@ -2911,29 +2928,40 @@ def _clean_preds(df):
     return df.dropna(subset=["season", "week", "home", "away"]).reset_index(drop=True)
 
 
+PRED_REMOTE = "nfl_predictions_app.csv"      # picks saved inside the app, kept on the GitHub data branch when a token is set
+PRED_KEY = ["season", "week", "home", "away"]
+
+
+def _pred_key(d):
+    return d["season"].astype(int).astype(str) + "|" + d["week"].astype(int).astype(str) + "|" + d["home"].astype(str) + "|" + d["away"].astype(str)
+
+
+def _merge_preds(frames):
+    """One row per game: a pick saved before the game beats one saved after; among those, the newest save wins."""
+    frames = [_clean_preds(f) for f in frames if f is not None and len(f)]
+    if not frames:
+        return _clean_preds(pd.DataFrame(columns=PRED_COLS))
+    d = pd.concat(frames, ignore_index=True)
+    d["saved_at"] = d["saved_at"].fillna("").astype(str)
+    d["_k"] = _pred_key(d)
+    d = d.sort_values(["late", "saved_at"], ascending=[False, True], kind="stable").drop_duplicates("_k", keep="last").drop(columns="_k")
+    return d.sort_values(["season", "week", "home"]).reset_index(drop=True)
+
+
 def load_preds():
+    frames = []
     p = pred_path()
-    df = None
-    if os.path.exists(p):
+    if os.path.exists(p):                      # the file in your repo (the daily robot's picks) or the local file
         try:
-            df = pd.read_csv(p)
+            frames.append(pd.read_csv(p))
         except Exception:
-            df = None
-    if df is None:
-        df = st.session_state.get("preds_mem")
-    if df is None:
-        df = pd.DataFrame(columns=PRED_COLS)
-    return _clean_preds(df)
-
-
-def save_preds(df):
-    df = _clean_preds(df)
-    st.session_state["preds_mem"] = df
-    try:
-        df.to_csv(pred_path(), index=False)
-        return True
-    except Exception:
-        return False
+            pass
+    if _gh_cfg():                              # picks saved inside the app
+        frames.append(store_read(PRED_REMOTE, tuple(PRED_COLS), "github"))
+    mem = st.session_state.get("preds_mem")
+    if mem is not None:
+        frames.append(mem)
+    return _merge_preds(frames)
 
 
 def add_preds(new):
@@ -2941,12 +2969,32 @@ def add_preds(new):
     new = _clean_preds(new)
     if len(old) and len(new):
         # a pick saved before the game must not be overwritten by one saved after it started
-        k = lambda d: d["season"].astype(int).astype(str) + "|" + d["week"].astype(int).astype(str) + "|" + d["home"] + "|" + d["away"]
-        keep_old = set(k(old[~old["late"].astype(bool)]))
-        new = new[~(new["late"].astype(bool) & k(new).isin(keep_old))]
-    allp = pd.concat([old, new], ignore_index=True)
-    allp = allp.drop_duplicates(["season", "week", "home", "away"], keep="last")
-    return allp, save_preds(allp)
+        keep_old = set(_pred_key(old[~old["late"].astype(bool)]))
+        new = new[~(new["late"].astype(bool) & _pred_key(new).isin(keep_old))]
+    ok = True
+    if len(new):
+        if _gh_cfg():
+            ok, where = store_append(PRED_REMOTE, PRED_COLS, new, PRED_KEY, "Save picks")
+            st.session_state["pred_where"] = where
+        else:
+            try:
+                _merge_preds([old, new]).to_csv(pred_path(), index=False)
+                st.session_state["pred_where"] = "local"
+            except Exception:
+                ok = False
+    allp = _merge_preds([old, new])
+    st.session_state["preds_mem"] = allp
+    return allp, ok
+
+
+def clear_preds():
+    st.session_state["preds_mem"] = _clean_preds(pd.DataFrame(columns=PRED_COLS))
+    if _gh_cfg():
+        _store_modify(PRED_REMOTE, PRED_COLS, lambda cur: cur.iloc[0:0], "Clear picks")
+    try:
+        pd.DataFrame(columns=PRED_COLS).to_csv(pred_path(), index=False)
+    except Exception:
+        pass
 
 
 def slate_to_preds(sl, season):
@@ -3044,10 +3092,18 @@ def _clean_bets(df):
     for c in ("season", "week", "line", "odds", "stake", "model_p", "ev", "pnl"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["status"] = df["status"].fillna("open").replace("", "open")
-    return df.dropna(subset=["id"]).reset_index(drop=True)
+    df = df.dropna(subset=["id"]).copy()
+    df["id"] = df["id"].astype(str)
+    return df.reset_index(drop=True)
+
+
+def bets_file(profile):
+    return f"nfl_bets_{safe_profile(profile)}.csv"
 
 
 def load_bets(profile):
+    if _gh_cfg():
+        return _clean_bets(store_read(bets_file(profile), tuple(BET_COLS), "github"))
     p = bets_path(profile)
     df = None
     if os.path.exists(p):
@@ -3062,7 +3118,7 @@ def load_bets(profile):
     return _clean_bets(df)
 
 
-def save_bets(df, profile):
+def _save_bets_local(df, profile):
     df = _clean_bets(df)
     st.session_state[f"bets_mem_{safe_profile(profile)}"] = df
     try:
@@ -3072,12 +3128,30 @@ def save_bets(df, profile):
         return False
 
 
+def upsert_bets(rows, profile):
+    """Adds new bets or replaces changed ones (matched by id). Only the rows you pass are touched, so two devices can't wipe each other's bets."""
+    rows = _clean_bets(rows)
+    if rows.empty:
+        return True
+    if _gh_cfg():
+        ok, where = store_append(bets_file(profile), BET_COLS, rows, ["id"], "Update bets")
+        st.session_state["bet_where"] = where
+        return ok
+    cur = load_bets(profile)
+    return _save_bets_local(pd.concat([cur, rows], ignore_index=True).drop_duplicates("id", keep="last"), profile)
+
+
+def delete_bet(cid, profile):
+    if _gh_cfg():
+        return _store_modify(bets_file(profile), BET_COLS, lambda cur: cur[cur["id"].astype(str) != str(cid)], "Delete bet")
+    cur = load_bets(profile)
+    return _save_bets_local(cur[cur["id"].astype(str) != str(cid)], profile)
+
+
 def add_bet(profile, row):
-    df = load_bets(profile)
     row = dict(row)
     row.update({"id": f"{pd.Timestamp.now(tz='UTC').strftime('%Y%m%d%H%M%S%f')}", "profile": safe_profile(profile), "placed_at": pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M"), "status": "open", "pnl": None})
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    return save_bets(df, profile)
+    return upsert_bets(pd.DataFrame([row]), profile)
 
 
 def split_probs(win, push, loss=None):
@@ -3152,6 +3226,17 @@ def _settle(status_p, stake, odds):
     return 0.0
 
 
+def stats_pending(pl, season, week, team, gameday):
+    """True while a finished game's player stats have not been published yet (they usually arrive the next day), so a prop must wait instead of grading as void."""
+    try:
+        if ((pl["season"] == season) & (pl["week"] == week) & (pl["tm"] == team)).any():
+            return False
+        gd = pd.to_datetime(gameday, errors="coerce")
+        return bool(pd.isna(gd) or (pd.Timestamp.now() - gd).days < 4)
+    except Exception:
+        return False
+
+
 def grade_bets(bets, sched, pl):
     """Settles every open bet whose game is final: game bets from the schedule's scores, props from the player's real box-score stats."""
     b = bets.copy()
@@ -3179,6 +3264,8 @@ def grade_bets(bets, sched, pl):
                 res = "push" if tt == float(r["line"]) else ("won" if ((tt > float(r["line"])) == (r["pick"] == "Over")) else "lost")
         else:
             cols = STAT_COL.get(r["stat"], [])
+            if stats_pending(pl, r["season"], r["week"], r["team"], g.iloc[0].get("gameday")):
+                continue
             x = pl[(pl["season"] == r["season"]) & (pl["week"] == r["week"]) & (pl["pname"] == r["player"]) & (pl["tm"] == r["team"])]
             if x.empty or not cols:
                 res = "void"
@@ -3326,6 +3413,8 @@ def grade_sgp(r, hs, as_, pl):
                 res.append("push" if t == line else ("won" if ((t > line) == (pick == "Over")) else "lost"))
         else:
             cols = STAT_COL.get(lg["stat"], [])
+            if stats_pending(pl, r["season"], r["week"], lg["team"], r.get("gameday")):
+                return None         # the player stats are not out yet: wait
             x = pl[(pl["season"] == r["season"]) & (pl["week"] == r["week"]) & (pl["pname"] == lg["player"]) & (pl["tm"] == lg["team"])]
             if x.empty or not cols:
                 res.append("push")      # player never appeared: the leg is voided
@@ -3640,6 +3729,8 @@ def _parse_csv(text, cols):
     for c in cols:
         if c not in df.columns:
             df[c] = None
+    if "id" in df.columns:
+        df["id"] = df["id"].astype(str)
     return df[cols]
 
 
@@ -3693,6 +3784,47 @@ def store_append(name, cols, new, key_cols, msg="update"):
         return True, "local"
     except Exception:
         return False, "none"
+
+
+def _store_modify(name, cols, fn, msg="update"):
+    """Reads the stored file, lets fn change it, writes it back (GitHub when a token is set, otherwise the local file). Returns True when it saved."""
+    cols = list(cols)
+    if _gh_cfg():
+        try:
+            if _gh_ensure_branch():
+                for _ in range(4):
+                    text, sha = _gh_read(name)
+                    new = fn(_parse_csv(text, cols))[cols]
+                    r = _gh_write(name, new.to_csv(index=False), sha, msg)
+                    if r.status_code in (200, 201):
+                        store_read.clear()
+                        return True
+                    if r.status_code not in (409, 422):
+                        break
+        except Exception:
+            pass
+        return False
+    try:
+        new = fn(store_read(name, tuple(cols), "local"))[cols]
+        new.to_csv(_local_path(name), index=False)
+        store_read.clear()
+        return True
+    except Exception:
+        return False
+
+
+ON_CLOUD = os.path.isdir("/mount/src")      # Streamlit Community Cloud mounts the repo here
+
+
+def storage_note(what):
+    """One line (or a warning) saying where bets or picks are kept."""
+    if _gh_cfg():
+        st.caption(f"✅ Your {what} are saved to your GitHub data branch, so they stay after the app restarts and show up on your phone and your PC.")
+    elif ON_CLOUD:
+        st.warning(f"Your {what} are NOT being saved permanently yet. Right now they sit in a temporary file on the server that is erased when the app restarts, and your phone and PC can't see each other's. "
+                   "Fix: add GH_TOKEN and GH_REPO in the app's Secrets (steps are at the top of the Setup tab).")
+    else:
+        st.caption(f"Your {what} are saved in a file next to the app on this computer. To keep them on Streamlit Cloud and share them between devices, add GH_TOKEN and GH_REPO in the app's Secrets (see the Setup tab).")
 
 
 def kickoff_utc(row):
@@ -3992,6 +4124,9 @@ def load_odds_history():
 # APP
 # =====================================================================
 sched, pl, seasons = load_data()
+_fs, _fs_at = load_sched_fresh(tuple(seasons))          # re-checked every few minutes; the big player-stats download is not
+if _fs is not None and len(_fs) >= 0.9 * len(sched):
+    sched = _fs
 version = int(sched["home_score"].notna().sum())
 latest = seasons[-1]
 pool0 = build_pool(pl, len(pl))
@@ -4009,6 +4144,60 @@ st.markdown(G7_CSS, unsafe_allow_html=True)
 st.title("🏈 NFL Simulator")
 with st.container(key="topcap"):
     st.caption(f"{seasons[0]}-{seasons[-1]} data, {version:,} completed games. Simulate any game, watch it play out on the field, and track your predictions and bets.")
+def score_status(sched_df, season):
+    """Counts the games that finished in the last day, and the ones that have kicked off but have no final score yet."""
+    now = _dt.now(_tz.utc)
+    cur = sched_df[sched_df["season"] == season]
+    gd = pd.to_datetime(cur["gameday"], errors="coerce")
+    near = cur[(gd >= pd.Timestamp(now.date()) - pd.Timedelta(days=2)) & (gd <= pd.Timestamp(now.date()) + pd.Timedelta(days=1))]
+    fin, live, soon = 0, [], 0
+    for r in near.to_dict("records"):
+        k = kickoff_utc(r)
+        if k is None:
+            continue
+        age = (now - k).total_seconds() / 3600.0
+        done = pd.notna(r["home_score"]) and pd.notna(r["away_score"])
+        if done and 0 <= age < 30:
+            fin += 1
+        elif not done and 0 <= age < 6:
+            live.append(f"{r['away_team']} @ {r['home_team']}")
+        elif not done and -1 <= age < 0:
+            soon += 1
+    return {"final": fin, "live": live, "soon": soon}
+
+
+_frag = getattr(st, "fragment", None)
+if _frag is not None:
+    @_frag(run_every=150)
+    def _live_watch(seasons_t, n_known):
+        """While a game is on, quietly re-checks the schedule and refreshes the whole page the moment a new final score appears."""
+        if not score_status(sched, latest)["live"]:
+            return
+        f, _ = load_sched_fresh(seasons_t)
+        if f is not None and int(f["home_score"].notna().sum()) != n_known:
+            st.rerun()
+
+_ss = score_status(sched, latest)
+with st.container(key="scorebar"):
+    _sb1, _sb2 = st.columns([4, 1])
+    _age = int((pd.Timestamp.now(tz="UTC") - _fs_at).total_seconds() // 60) if _fs_at is not None else None
+    _bits = [("Scores checked just now" if (_age is not None and _age < 1) else (f"Scores checked {_age} min ago" if _age is not None else "Scores not checked"))]
+    if _ss["final"]:
+        _bits.append(f"{_ss['final']} final in the last day")
+    if _ss["live"]:
+        _bits.append(f"{len(_ss['live'])} in progress or waiting for the final score (checking every few minutes)")
+    elif _ss["soon"]:
+        _bits.append(f"{_ss['soon']} about to start")
+    _sb1.caption(" · ".join(_bits))
+    if _sb2.button("🔄 Check scores", key="chk_scores", help="Looks for new final scores right now."):
+        try:
+            nfl.clear_cache()
+        except Exception:
+            pass
+        load_sched_fresh.clear()
+        st.rerun()
+if _frag is not None:
+    _live_watch(tuple(seasons), version)
 teams = fit_ratings(sched, 0.75, 20.0, version)["teams"]
 with st.container(key="matchbar"):
     mb1, mb2 = st.columns(2)
@@ -4029,6 +4218,22 @@ with t_teams:
 tab_game, tab_anim, tab_slate, tab_drives = t_game, t_field, t_week, tab_pbp
 
 with t_setup:
+    with st.expander("Keep my bets and picks permanently (one-time setup)", expanded=not _gh_cfg()):
+        if _gh_cfg():
+            st.success("Done. Bets, tracker picks and Pick'em picks are saved on your GitHub data branch.")
+        else:
+            st.markdown("""Streamlit Cloud erases files whenever the app restarts, and your phone and PC don't share them. To fix that, the app can save to a separate branch of your GitHub repo.
+
+1. On github.com open **Settings** (your profile picture, top right), then **Developer settings**, then **Personal access tokens**, then **Fine-grained tokens**, then **Generate new token**.
+2. Name it `nfl-app`, set the expiration to the longest allowed, and under **Repository access** choose **Only select repositories** and pick `nfl-sim`.
+3. Under **Permissions**, then **Repository permissions**, set **Contents** to **Read and write**. Click **Generate token** and copy it (it starts with `github_pat_`).
+4. In your Streamlit app open **Manage app**, then **Settings**, then **Secrets**, and paste these two lines, using your token and repo name:
+
+```
+GH_TOKEN = "github_pat_your_token_here"
+GH_REPO = "yourname/nfl-sim"
+```
+5. Click **Save** and wait for the app to restart. This page will then say Done.""")
     st.subheader("Model settings")
     decay = st.slider("How much recent seasons matter", 0.4, 1.0, 0.75, 0.05, help="Lower = older seasons count less")
     alpha = st.slider("Rating smoothing", 1.0, 60.0, 20.0, 1.0, help="Higher = ratings pulled harder toward average")
@@ -4304,7 +4509,7 @@ with tab_slate:
                 b1.download_button("Download as CSV", sdf[[c for c in sdf.columns if not c.startswith("_")]].to_csv(index=False).encode("utf-8"), file_name=f"nfl_week_{sl['week']}_sim.csv", mime="text/csv")
                 if b2.button("Save these picks to my tracker", key="slate_save"):
                     _allp, _ok = add_preds(slate_to_preds(sl, latest))
-                    st.success(f"Saved {len(sdf)} picks for week {sl['week']}. See the Prediction tracker tab." + ("" if _ok else " (Could not write the file here, so they are kept for this session only; download a backup from the tracker tab.)"))
+                    st.success(f"Saved {len(sdf)} picks for week {sl['week']}. See the Prediction tracker tab." + (" Stored on GitHub, so they stay after a restart." if (_ok and st.session_state.get("pred_where") == "github") else ("" if _ok else " (Could not save them permanently, so they are kept for this session only; download a backup from the tracker tab.)")))
                 st.caption("Sim minus line: positive means the simulator likes the home team more than the market does. QBs used shows each team's default starter, with the points-per-game effect in brackets when it isn't the QB the team ratings were built around. Not betting advice: the market knows things the model doesn't.")
 
 with tab_bet:
@@ -4608,7 +4813,8 @@ with tab_track:
             st.rerun()
         except Exception:
             st.error("That file didn't look like a picks backup.")
-    st.caption("Where picks are stored: a file next to the app. If the app runs on Streamlit Cloud, that file is shared by everyone who opens your link and is erased whenever the app restarts, so download a backup now and then and restore it here.")
+    storage_note("saved picks")
+    st.caption("Picks the daily robot saves live in nfl_predictions.csv in your GitHub repo; picks you save here are kept alongside them and the tracker shows both.")
     if preds.empty:
         st.info("No saved picks yet. Simulate a week on the Week slate tab and press Save these picks to my tracker.")
     else:
@@ -4646,7 +4852,7 @@ with tab_track:
         st.dataframe(g2[["week", "Game", "Sim pick", "Sim home win %", "Result", "Correct", "saved_at", "late"]].rename(columns={"saved_at": "Saved (UTC)", "late": "Saved late"}), hide_index=True, column_config=cfg_t, height=min(36 * (len(g2) + 1) + 3, 600))
         with st.expander("Delete all saved picks"):
             if st.checkbox("Yes, delete everything I've saved", key="trk_del_ok") and st.button("Delete", key="trk_del"):
-                save_preds(pd.DataFrame(columns=PRED_COLS))
+                clear_preds()
                 st.rerun()
 
 with tab_bt:
@@ -5143,10 +5349,24 @@ with tab_mybets:
     bank0 = mc2.number_input("Starting bankroll ($)", min_value=10.0, value=1000.0, step=100.0, key="bet_bank0")
     kfr = mc3.select_slider("Kelly fraction", [0.1, 0.25, 0.5, 1.0], value=0.25, key="bet_frac", help="Full Kelly is very aggressive. Most people use a quarter or less.")
     bets = load_bets(prof)
+    _before = dict(zip(bets["id"], bets["status"]))
     bets, n_new = grade_bets(bets, sched, pl)
     if n_new:
-        save_bets(bets, prof)
+        upsert_bets(bets[bets["id"].map(_before) != bets["status"]], prof)
         st.toast(f"Graded {n_new} bet(s) from final results.")
+    storage_note("bets")
+    _op = bets[bets["status"] == "open"]
+    if len(_op):
+        _rc = st.columns([1, 2])
+        if _rc[0].button("Check results now", key="bets_check", help="Looks for new final scores and player stats right away."):
+            try:
+                nfl.clear_cache()
+            except Exception:
+                pass
+            load_sched_fresh.clear()
+            load_data.clear()
+            st.rerun()
+        _rc[1].caption(f"{len(_op)} open. Team bets settle when the score is final. Player props wait for the player stats, which usually post the next day.")
     if bets.empty:
         st.info("No bets yet. Simulate a game, then use Place a bet. Open bets grade themselves when the game is final.")
     else:
@@ -5183,10 +5403,10 @@ with tab_mybets:
                     bets.at[i, "status"] = stt
                     bets.at[i, "pnl"] = _settle(stt, float(bets.at[i, "stake"]), float(bets.at[i, "odds"]))
                     bets.at[i, "settled_at"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M")
-                    save_bets(bets, prof)
+                    upsert_bets(bets.loc[[i]], prof)
                     st.rerun()
             if cc4.button("Delete", key="mb_del") and cid:
-                save_bets(bets[bets["id"] != cid], prof)
+                delete_bet(cid, prof)
                 st.rerun()
     bc1, bc2 = st.columns(2)
     bc1.download_button("Download my bets (backup)", bets.to_csv(index=False).encode("utf-8"), file_name=f"nfl_bets_{prof}.csv", mime="text/csv", disabled=bets.empty)
@@ -5194,10 +5414,9 @@ with tab_mybets:
     if upb is not None and st.session_state.get("bet_up_done") != getattr(upb, "file_id", upb.name):
         try:
             old = pd.read_csv(upb)
-            allb = pd.concat([load_bets(prof), _clean_bets(old)], ignore_index=True).drop_duplicates("id", keep="last")
-            save_bets(allb, prof)
+            upsert_bets(_clean_bets(old), prof)
             st.session_state["bet_up_done"] = getattr(upb, "file_id", upb.name)
             st.rerun()
         except Exception:
             st.error("That file didn't look like a bets backup.")
-    st.caption("Bets are stored in a file next to the app, one file per profile name. If the app runs on Streamlit Cloud, those files are shared by everyone with your link and are erased whenever the app restarts, so pick your own profile name and download a backup now and then.")
+    st.caption("Bets are kept per profile name. Use the same profile name on your phone and your PC to see the same bets. Anyone who has your app link can open any profile name, so pick a name that is yours. Download a backup now and then.")
